@@ -6,7 +6,7 @@
 {% block content %}
 <div class="page-header page-header-compact">
     <h2>Novo usuário</h2>
-    <p>3 fotos do rosto para melhor precisão.</p>
+    <p>3 fotos com os olhos abertos. Óculos e chapéu são detectados.</p>
 </div>
 
 <div class="panel panel-wide">
@@ -34,6 +34,7 @@
                 </div>
             </div>
 
+            <div id="attrChips" class="attr-chips" aria-live="polite"></div>
             <div id="thumbs" class="thumbs" style="display:none;"></div>
 
             <div class="capture-controls">
@@ -75,6 +76,24 @@
     border-radius: 8px;
     border: 1px solid var(--border);
 }
+.attr-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+    min-height: 28px;
+}
+.attr-chip {
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--bg-accent);
+    color: var(--text-muted);
+}
+.attr-chip.ok { background: var(--success-soft); color: var(--success); }
+.attr-chip.warn { background: var(--warning-soft); color: var(--warning); }
+.attr-chip.info { background: var(--accent-soft); color: var(--accent); }
 </style>
 <script>
 const REQUIRED_CAPTURES = 3;
@@ -83,6 +102,8 @@ let detectInterval = null;
 let isDetecting = false;
 let captures = [];
 let lastCaptureAt = 0;
+let lastAnalysis = null;
+let readyStreak = 0;
 
 function setStatus(text, type = '') {
     const el = document.getElementById('cameraStatus');
@@ -90,8 +111,21 @@ function setStatus(text, type = '') {
     el.className = 'status-bar' + (type ? ' ' + type : '');
 }
 
+function renderAttrChips(fa) {
+    const box = document.getElementById('attrChips');
+    if (!fa) { box.innerHTML = ''; return; }
+    const chips = [];
+    chips.push(fa.eyes_open ? ['Olhos abertos', 'ok'] : ['Abra os olhos', 'warn']);
+    if (fa.glasses) chips.push(['Oculos', 'info']);
+    if (fa.hat) chips.push(['Chapeu/bone', 'info']);
+    if (fa.capture_ready) chips.push(['Pronto', 'ok']);
+    box.innerHTML = chips.map(([label, cls]) =>
+        '<span class="attr-chip ' + cls + '">' + label + '</span>'
+    ).join('');
+}
+
 function updateCaptureUI() {
-    document.getElementById('captureCountLabel').textContent = `${captures.length}/${REQUIRED_CAPTURES}`;
+    document.getElementById('captureCountLabel').textContent = captures.length + '/' + REQUIRED_CAPTURES;
     const thumbs = document.getElementById('thumbs');
     thumbs.innerHTML = '';
     if (captures.length) {
@@ -109,34 +143,31 @@ function updateCaptureUI() {
     }
     document.getElementById('submitBtn').disabled = captures.length < 1 && !document.getElementById('imagem').files.length;
     if (captures.length >= REQUIRED_CAPTURES) {
-        setStatus(`${REQUIRED_CAPTURES} fotos capturadas. Pode cadastrar.`, 'success');
+        setStatus(REQUIRED_CAPTURES + ' fotos capturadas. Pode cadastrar.', 'success');
         document.getElementById('submitBtn').disabled = false;
     }
 }
 
 function cameraErrorMessage(error) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        return 'Este navegador não suporta câmera. Use Chrome/Edge em HTTPS.';
+        return 'Este navegador nao suporta camera. Use HTTPS.';
     }
     switch (error.name) {
         case 'NotAllowedError':
         case 'PermissionDeniedError':
-            return 'Permissão da câmera negada.';
+            return 'Permissao da camera negada.';
         case 'NotFoundError':
-            return 'Nenhuma câmera encontrada.';
+            return 'Nenhuma camera encontrada.';
         case 'NotReadableError':
-            return 'Câmera em uso por outro aplicativo.';
+            return 'Camera em uso por outro aplicativo.';
         case 'SecurityError':
             return 'Acesso bloqueado. Use HTTPS.';
         default:
-            return 'Erro ao acessar câmera: ' + (error.message || error.name);
+            return 'Erro ao acessar camera: ' + (error.message || error.name);
     }
 }
 
 async function startCamera(videoEl) {
-    if (!navigator.mediaDevices?.getUserMedia) {
-        throw Object.assign(new Error('getUserMedia indisponível'), { name: 'NotSupportedError' });
-    }
     const mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
@@ -148,14 +179,8 @@ async function startCamera(videoEl) {
 }
 
 function stopCamera() {
-    if (detectInterval) {
-        clearInterval(detectInterval);
-        detectInterval = null;
-    }
-    if (stream) {
-        stream.getTracks().forEach(t => t.stop());
-        stream = null;
-    }
+    if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     const video = document.getElementById('video');
     video.srcObject = null;
     video.style.display = 'none';
@@ -166,21 +191,21 @@ function stopCamera() {
     document.getElementById('startWebcamBtn').style.display = 'inline-flex';
     document.getElementById('stopWebcamBtn').style.display = 'none';
     document.getElementById('captureBtn').style.display = 'none';
+    readyStreak = 0;
 }
 
 document.getElementById('startWebcamBtn').addEventListener('click', async () => {
-    const video = document.getElementById('video');
-    setStatus('Solicitando acesso à câmera...');
+    setStatus('Solicitando acesso a camera...');
     try {
-        stream = await startCamera(video);
+        stream = await startCamera(document.getElementById('video'));
         document.getElementById('cameraPlaceholder').style.display = 'none';
         document.getElementById('cameraStage').classList.add('is-active');
         document.getElementById('faceGuide').style.display = 'block';
         document.getElementById('startWebcamBtn').style.display = 'none';
         document.getElementById('stopWebcamBtn').style.display = 'inline-flex';
         document.getElementById('captureBtn').style.display = 'inline-flex';
-        setStatus(`Câmera ativa. Capture ${REQUIRED_CAPTURES} fotos.`);
-        detectInterval = setInterval(detectAndGuideFace, 450);
+        setStatus('Mantenha os olhos abertos. Capture ' + REQUIRED_CAPTURES + ' fotos.');
+        detectInterval = setInterval(detectAndGuideFace, 500);
     } catch (error) {
         console.error(error);
         setStatus(cameraErrorMessage(error), 'error');
@@ -189,7 +214,8 @@ document.getElementById('startWebcamBtn').addEventListener('click', async () => 
 
 document.getElementById('stopWebcamBtn').addEventListener('click', () => {
     stopCamera();
-    setStatus('Câmera desligada.');
+    renderAttrChips(null);
+    setStatus('Camera desligada.');
 });
 
 document.getElementById('clearCapturesBtn').addEventListener('click', () => {
@@ -205,7 +231,6 @@ async function detectAndGuideFace() {
     const overlayCanvas = document.getElementById('overlayCanvas');
     const guideText = document.getElementById('guideText');
     const faceGuide = document.getElementById('faceGuide');
-
     if (!video.srcObject || video.readyState < 2 || video.videoWidth === 0) return;
 
     isDetecting = true;
@@ -216,7 +241,6 @@ async function detectAndGuideFace() {
 
         const formData = new FormData();
         formData.append('imagem_base64', canvas.toDataURL('image/jpeg', 0.65));
-
         const response = await fetch('{{ url_for("api_detect") }}', { method: 'POST', body: formData });
         const data = await response.json();
 
@@ -225,41 +249,61 @@ async function detectAndGuideFace() {
         const ctx = overlayCanvas.getContext('2d');
         ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 
-        if (data.success && data.results?.length > 0) {
-            const [x, y, w, h] = data.results[0].location;
+        if (data.success && data.results && data.results.length > 0) {
+            const face = data.results[0];
+            const loc = face.location;
+            const x = loc[0], y = loc[1], w = loc[2], h = loc[3];
+            const fa = face.facial_analysis || {};
+            lastAnalysis = fa;
+            renderAttrChips(fa);
+
             overlayCanvas.style.display = 'block';
-            ctx.strokeStyle = '#3dd68c';
+            const eyesOk = !!fa.eyes_open;
+            ctx.strokeStyle = eyesOk && fa.capture_ready ? '#3dd68c' : '#f5a524';
             ctx.lineWidth = 2;
             ctx.strokeRect(x, y, w, h);
 
             const faceCenterX = x + w / 2;
-            const faceCenterY = y + h / 2;
             const offsetX = Math.abs(faceCenterX - video.videoWidth / 2);
-            const offsetY = Math.abs(faceCenterY - video.videoHeight / 2);
+            const offsetY = Math.abs((y + h / 2) - video.videoHeight / 2);
             const maxOffset = Math.min(video.videoWidth, video.videoHeight) * 0.2;
             const faceHeightRatio = h / video.videoHeight;
             const sizeOK = faceHeightRatio >= 0.2 && faceHeightRatio <= 0.65;
             const centered = offsetX < maxOffset && offsetY < maxOffset;
 
-            if (centered && sizeOK) {
-                faceGuide.classList.add('ready');
-                guideText.textContent = `Foto ${captures.length + 1}/${REQUIRED_CAPTURES} — aguarde...`;
-                const now = Date.now();
-                if (now - lastCaptureAt > 1600) {
-                    lastCaptureAt = now;
-                    takeCapture();
-                }
-            } else {
+            if (!eyesOk) {
                 faceGuide.classList.remove('ready');
+                readyStreak = 0;
+                guideText.textContent = 'Abra os olhos para capturar';
+                setStatus('Captura bloqueada ate os olhos estarem abertos.', 'error');
+            } else if (!centered || !sizeOK) {
+                faceGuide.classList.remove('ready');
+                readyStreak = 0;
                 if (!centered) {
                     guideText.textContent = faceCenterX < video.videoWidth / 2 ? 'Mova para a direita' : 'Mova para a esquerda';
                 } else {
                     guideText.textContent = faceHeightRatio < 0.2 ? 'Aproxime-se' : 'Afaste-se um pouco';
                 }
+            } else if (!fa.capture_ready) {
+                faceGuide.classList.remove('ready');
+                readyStreak = 0;
+                guideText.textContent = (fa.capture_blockers && fa.capture_blockers[0]) || 'Ajuste a pose';
+            } else {
+                faceGuide.classList.add('ready');
+                readyStreak += 1;
+                guideText.textContent = 'Olhos ok — foto ' + (captures.length + 1) + '/' + REQUIRED_CAPTURES;
+                const now = Date.now();
+                if (readyStreak >= 2 && now - lastCaptureAt > 1700) {
+                    lastCaptureAt = now;
+                    takeCapture();
+                }
             }
         } else {
             overlayCanvas.style.display = 'none';
             faceGuide.classList.remove('ready');
+            readyStreak = 0;
+            lastAnalysis = null;
+            renderAttrChips(null);
             guideText.textContent = 'Nenhum rosto detectado';
         }
     } catch (error) {
@@ -271,6 +315,10 @@ async function detectAndGuideFace() {
 
 function takeCapture() {
     if (captures.length >= REQUIRED_CAPTURES) return;
+    if (lastAnalysis && !lastAnalysis.eyes_open) {
+        setStatus('Nao foi possivel capturar: olhos fechados.', 'error');
+        return;
+    }
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
     if (!video || video.readyState < 2) return;
@@ -280,16 +328,24 @@ function takeCapture() {
     canvas.getContext('2d').drawImage(video, 0, 0);
     captures.push(canvas.toDataURL('image/jpeg', 0.92));
     updateCaptureUI();
+    readyStreak = 0;
 
     if (captures.length >= REQUIRED_CAPTURES) {
         document.getElementById('guideText').textContent = 'Pronto!';
         stopCamera();
     } else {
-        setStatus(`Captura ${captures.length}/${REQUIRED_CAPTURES}. Mova levemente a cabeça e aguarde.`);
+        const extras = (lastAnalysis && lastAnalysis.accessories && lastAnalysis.accessories.length)
+            ? ' Detectado: ' + lastAnalysis.accessories.join(', ') + '.'
+            : '';
+        setStatus('Captura ' + captures.length + '/' + REQUIRED_CAPTURES + '.' + extras, 'success');
     }
 }
 
 document.getElementById('captureBtn').addEventListener('click', () => {
+    if (lastAnalysis && !lastAnalysis.eyes_open) {
+        setStatus('Abra os olhos para capturar.', 'error');
+        return;
+    }
     lastCaptureAt = Date.now();
     takeCapture();
 });
@@ -301,7 +357,7 @@ document.getElementById('imagem').addEventListener('change', (e) => {
         stopCamera();
         captures = [ev.target.result];
         updateCaptureUI();
-        setStatus('Imagem carregada. Ideal: use 3 fotos pela câmera.', 'success');
+        setStatus('Imagem carregada. Ideal: use 3 fotos pela camera.', 'success');
         document.getElementById('submitBtn').disabled = false;
     };
     reader.readAsDataURL(e.target.files[0]);
@@ -317,7 +373,7 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
     formData.append('cpf', document.getElementById('cpf').value.trim());
 
     if (captures.length) {
-        captures.forEach((src, i) => formData.append(`imagem_base64_${i}`, src));
+        captures.forEach((src, i) => formData.append('imagem_base64_' + i, src));
     } else if (document.getElementById('imagem').files.length) {
         formData.append('imagem', document.getElementById('imagem').files[0]);
     } else {
@@ -335,7 +391,7 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
         const response = await fetch('{{ url_for("register") }}', { method: 'POST', body: formData });
         const data = await response.json();
         if (data.success) {
-            messageDiv.textContent = data.message || 'Usuário cadastrado.';
+            messageDiv.textContent = data.message || 'Usuario cadastrado.';
             messageDiv.className = 'message success';
             messageDiv.style.display = 'block';
             setTimeout(() => { window.location.href = '{{ url_for("index") }}'; }, 1200);

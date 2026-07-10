@@ -236,45 +236,97 @@ def recognize():
 
 @app.route('/api/detect', methods=['POST'])
 def api_detect():
-    """API REST para apenas detectar rostos (sem reconhecimento) - usado no guia de posicionamento"""
-    # Aceita tanto base64 quanto arquivo
+    """Detecta rostos + análise (olhos, óculos, chapéu) para o guia de cadastro."""
     image = None
-    
+
     if 'imagem_base64' in request.form:
-        base64_string = request.form['imagem_base64']
-        if ',' in base64_string:
-            base64_string = base64_string.split(',')[1]
-        try:
-            image_data = base64.b64decode(base64_string)
-            nparr = np.frombuffer(image_data, np.uint8)
-            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        except Exception as e:
-            return jsonify({'error': f'Erro ao decodificar imagem: {str(e)}'}), 400
+        image = decode_base64_image(request.form['imagem_base64'])
     elif 'imagem' in request.files:
         file = request.files['imagem']
         if file and file.filename:
             image_bytes = file.read()
             nparr = np.frombuffer(image_bytes, np.uint8)
             image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
+
     if image is None:
         return jsonify({'error': 'Nenhuma imagem fornecida ou erro ao processar'}), 400
-    
-    # Apenas detecta rostos (sem reconhecimento)
-    faces = face_recognizer.detect_faces(image)
-    
-    # Se não detectou com OpenCV, tenta YOLO
-    if not faces:
-        faces = face_detector.detect_faces(image)
-    
-    # Converte para formato serializável
+
+    # Reduz para acelerar o guia no mobile
+    h, w = image.shape[:2]
+    max_side = 420
+    scale = 1.0
+    if max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+        image = cv2.resize(image, (int(w * scale), int(h * scale)))
+
+    detailed = face_recognizer.detect_faces_detailed(image)
+    if not detailed:
+        yolo_faces = face_detector.detect_faces(image)
+        detailed = [{'location': f, 'landmarks': None, 'score': 0.5, 'face_row': None} for f in yolo_faces]
+
     results = []
-    for face in faces:
-        x, y, w, h = face
+    for face in detailed:
+        x, y, w, h = face['location']
+        # Reescala para coordenadas da imagem original enviada
+        if scale != 1.0:
+            x = int(x / scale)
+            y = int(y / scale)
+            w = int(w / scale)
+            h = int(h / scale)
+
+        landmarks = face.get('landmarks')
+        # Landmarks também precisam de reescala
+        scaled_landmarks = None
+        if landmarks and scale != 1.0:
+            scaled_landmarks = {}
+            for key, value in landmarks.items():
+                if isinstance(value, (tuple, list)) and len(value) == 2:
+                    scaled_landmarks[key] = [float(value[0]) / scale, float(value[1]) / scale]
+                else:
+                    scaled_landmarks[key] = value
+        else:
+            scaled_landmarks = landmarks
+
+        # Análise usa a imagem já redimensionada + bbox nela
+        fx, fy, fw, fh = face['location']
+        try:
+            facial_info = facial_analysis.analyze_full_face(
+                image, (fx, fy, fw, fh), landmarks=face.get('landmarks')
+            )
+        except Exception as e:
+            print(f'Erro análise facial: {e}')
+            facial_info = {
+                'glasses': False,
+                'hat': False,
+                'eyes_open': False,
+                'left_eye': 'unknown',
+                'right_eye': 'unknown',
+                'accessories': [],
+                'capture_ready': False,
+                'capture_blockers': ['falha na análise'],
+            }
+
         results.append({
-            'location': [int(x), int(y), int(w), int(h)]
+            'location': [int(x), int(y), int(w), int(h)],
+            'landmarks': {
+                k: ([float(v[0]), float(v[1])] if isinstance(v, (tuple, list)) and len(v) == 2 else v)
+                for k, v in (scaled_landmarks or {}).items()
+            } if scaled_landmarks else None,
+            'facial_analysis': {
+                'glasses': bool(facial_info.get('glasses', False)),
+                'glasses_confidence': float(facial_info.get('glasses_confidence', 0.0)),
+                'hat': bool(facial_info.get('hat', False)),
+                'hat_confidence': float(facial_info.get('hat_confidence', 0.0)),
+                'left_eye': str(facial_info.get('left_eye', 'unknown')),
+                'right_eye': str(facial_info.get('right_eye', 'unknown')),
+                'eyes_open': bool(facial_info.get('eyes_open', False)),
+                'accessories': facial_info.get('accessories', []),
+                'capture_ready': bool(facial_info.get('capture_ready', False)),
+                'capture_blockers': facial_info.get('capture_blockers', []),
+                'quality': str(facial_info.get('quality', 'poor')),
+            }
         })
-    
+
     return jsonify({
         'success': True,
         'results': results

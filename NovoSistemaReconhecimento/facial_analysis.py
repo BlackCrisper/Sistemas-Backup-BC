@@ -176,20 +176,83 @@ class FacialAnalysis:
         else:
             return 'partial', 0.5
     
-    def analyze_eyes(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Dict:
+    def detect_hat(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Tuple[bool, float]:
         """
-        Analisa estado dos olhos (aberto/fechado) e detecta óculos
-        
-        Args:
-            face_image: Imagem completa
-            face_bbox: Bounding box do rosto (x, y, w, h)
-            
-        Returns:
-            Dicionário com informações sobre olhos e óculos
+        Heurística para chapéu/boné: região acima da testa com textura/cor diferente da pele.
         """
         x, y, w, h = face_bbox
-        
-        # Extrai região do rosto
+        img_h, img_w = face_image.shape[:2]
+
+        # Faixa acima do rosto (onde ficaria o chapéu)
+        band_h = max(12, int(h * 0.35))
+        y1 = max(0, y - band_h)
+        y2 = max(0, y + int(h * 0.12))
+        x1 = max(0, x + int(w * 0.1))
+        x2 = min(img_w, x + int(w * 0.9))
+
+        if y2 <= y1 or x2 <= x1:
+            return False, 0.0
+
+        top = face_image[y1:y2, x1:x2]
+        face_mid = face_image[y + int(h * 0.25):y + int(h * 0.55), x + int(w * 0.25):x + int(w * 0.75)]
+        if top.size == 0 or face_mid.size == 0:
+            return False, 0.0
+
+        if len(top.shape) == 3:
+            top_gray = cv2.cvtColor(top, cv2.COLOR_BGR2GRAY)
+            mid_gray = cv2.cvtColor(face_mid, cv2.COLOR_BGR2GRAY)
+            top_hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV)
+            mid_hsv = cv2.cvtColor(face_mid, cv2.COLOR_BGR2HSV)
+        else:
+            top_gray = top
+            mid_gray = face_mid
+            top_hsv = None
+            mid_hsv = None
+
+        # Diferença de brilho e saturação (chapéu costuma ser mais escuro/saturado que a pele)
+        brightness_gap = float(np.mean(mid_gray) - np.mean(top_gray))
+        texture_top = float(np.std(top_gray))
+        texture_mid = float(np.std(mid_gray))
+
+        sat_gap = 0.0
+        if top_hsv is not None and mid_hsv is not None:
+            sat_gap = float(np.mean(top_hsv[:, :, 1]) - np.mean(mid_hsv[:, :, 1]))
+
+        # Rosto muito baixo no frame (espaço grande acima) também sugere chapéu/boné
+        top_margin_ratio = y / max(img_h, 1)
+
+        score = 0.0
+        if brightness_gap > 32:
+            score += 0.35
+        if sat_gap > 25:
+            score += 0.25
+        if texture_top > texture_mid * 1.25 and texture_top > 28:
+            score += 0.2
+        if top_margin_ratio > 0.28 and brightness_gap > 20:
+            score += 0.2
+
+        has_hat = score >= 0.55
+        return has_hat, float(min(1.0, score))
+
+    def _eye_patch_from_landmark(self, gray: np.ndarray, point: Tuple[float, float], face_w: int, face_h: int) -> Optional[np.ndarray]:
+        px, py = int(point[0]), int(point[1])
+        ew = max(12, int(face_w * 0.18))
+        eh = max(10, int(face_h * 0.12))
+        x1 = max(0, px - ew // 2)
+        y1 = max(0, py - eh // 2)
+        x2 = min(gray.shape[1], x1 + ew)
+        y2 = min(gray.shape[0], y1 + eh)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return gray[y1:y2, x1:x2]
+
+    def analyze_eyes(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int],
+                     landmarks: Optional[Dict] = None) -> Dict:
+        """
+        Analisa estado dos olhos (aberto/fechado) e detecta óculos
+        """
+        x, y, w, h = face_bbox
+
         face_region = face_image[y:y+h, x:x+w]
         if face_region.size == 0:
             return {
@@ -198,174 +261,153 @@ class FacialAnalysis:
                 'left_eye': 'unknown',
                 'right_eye': 'unknown',
                 'left_eye_confidence': 0.0,
-                'right_eye_confidence': 0.0
+                'right_eye_confidence': 0.0,
+                'eyes_open': False,
+                'eyes_detected': 0,
             }
-        
-        # Converte para escala de cinza
+
         if len(face_region.shape) == 3:
             gray_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
         else:
             gray_face = face_region.copy()
-        
-        # Detecta óculos
-        has_glasses, glasses_confidence = self.detect_glasses(face_image, face_bbox)
-        
-        # Região dos olhos
-        eye_region_full = gray_face[0:int(h*0.65), :]
-        
-        # Tenta detectar olhos (com ou sem óculos)
-        if has_glasses:
-            eyes = self.eye_glasses_cascade.detectMultiScale(
-                eye_region_full,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(20, 20)
-            )
+
+        if len(face_image.shape) == 3:
+            gray_full = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
         else:
-            eyes = self.eye_cascade.detectMultiScale(
-                eye_region_full,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(20, 20)
-            )
-        
-        # Se não detectou, tenta o outro detector
-        if len(eyes) < 2:
-            if has_glasses:
-                eyes = self.eye_cascade.detectMultiScale(
-                    eye_region_full,
-                    scaleFactor=1.1,
-                    minNeighbors=3,
-                    minSize=(20, 20)
-                )
-            else:
-                eyes = self.eye_glasses_cascade.detectMultiScale(
-                    eye_region_full,
-                    scaleFactor=1.1,
-                    minNeighbors=3,
-                    minSize=(20, 20)
-                )
-        
-        # Analisa estado dos olhos
+            gray_full = face_image.copy()
+
+        has_glasses, glasses_confidence = self.detect_glasses(face_image, face_bbox)
+
         left_eye_state = 'unknown'
         right_eye_state = 'unknown'
         left_eye_conf = 0.0
         right_eye_conf = 0.0
-        
-        if len(eyes) >= 2:
-            # Ordena olhos da esquerda para direita
-            eyes = sorted(eyes, key=lambda e: e[0])
-            
-            # Olho esquerdo (do ponto de vista da pessoa)
-            left_eye_bbox = eyes[0]
-            try:
-                # Valida índices para evitar erro de indexação
-                ey, ex, ew, eh = left_eye_bbox
-                if ey >= 0 and ex >= 0 and ey + eh <= eye_region_full.shape[0] and ex + ew <= eye_region_full.shape[1]:
-                    left_eye_region = eye_region_full[
-                        ey:ey+eh,
-                        ex:ex+ew
-                    ]
-                    if left_eye_region.size > 0:
-                        left_eye_state, left_eye_conf = self.detect_eye_state(left_eye_region)
+        eyes_count = 0
+
+        # Preferência: patches ao redor dos landmarks (YuNet)
+        if landmarks and 'left_eye' in landmarks and 'right_eye' in landmarks:
+            left_patch = self._eye_patch_from_landmark(gray_full, landmarks['left_eye'], w, h)
+            right_patch = self._eye_patch_from_landmark(gray_full, landmarks['right_eye'], w, h)
+            if left_patch is not None and left_patch.size > 0:
+                left_eye_state, left_eye_conf = self.detect_eye_state(left_patch)
+                eyes_count += 1
+            if right_patch is not None and right_patch.size > 0:
+                right_eye_state, right_eye_conf = self.detect_eye_state(right_patch)
+                eyes_count += 1
+
+        # Fallback: cascade de olhos
+        if eyes_count < 2:
+            eye_region_full = gray_face[0:int(h * 0.65), :]
+            eyes = self.eye_glasses_cascade.detectMultiScale(
+                eye_region_full, 1.1, 3, minSize=(18, 18)
+            ) if has_glasses else self.eye_cascade.detectMultiScale(
+                eye_region_full, 1.1, 3, minSize=(18, 18)
+            )
+            if len(eyes) < 2:
+                eyes = self.eye_cascade.detectMultiScale(eye_region_full, 1.1, 3, minSize=(18, 18))
+
+            if len(eyes) >= 1:
+                eyes = sorted(eyes, key=lambda e: e[0])
+                eyes_count = len(eyes)
+                for idx, (ex, ey, ew, eh) in enumerate(eyes[:2]):
+                    patch = eye_region_full[ey:ey + eh, ex:ex + ew]
+                    if patch.size == 0:
+                        continue
+                    state, conf = self.detect_eye_state(patch)
+                    if idx == 0:
+                        left_eye_state, left_eye_conf = state, conf
                     else:
-                        left_eye_state, left_eye_conf = 'unknown', 0.0
-                else:
-                    left_eye_state, left_eye_conf = 'unknown', 0.0
-            except Exception as e:
-                print(f"Erro ao processar olho esquerdo: {e}")
-                left_eye_state, left_eye_conf = 'unknown', 0.0
-            
-            # Olho direito (do ponto de vista da pessoa)
-            right_eye_bbox = eyes[1]
-            try:
-                # Valida índices para evitar erro de indexação
-                ey, ex, ew, eh = right_eye_bbox
-                if ey >= 0 and ex >= 0 and ey + eh <= eye_region_full.shape[0] and ex + ew <= eye_region_full.shape[1]:
-                    right_eye_region = eye_region_full[
-                        ey:ey+eh,
-                        ex:ex+ew
-                    ]
-                    if right_eye_region.size > 0:
-                        right_eye_state, right_eye_conf = self.detect_eye_state(right_eye_region)
-                    else:
-                        right_eye_state, right_eye_conf = 'unknown', 0.0
-                else:
-                    right_eye_state, right_eye_conf = 'unknown', 0.0
-            except Exception as e:
-                print(f"Erro ao processar olho direito: {e}")
-                right_eye_state, right_eye_conf = 'unknown', 0.0
-        elif len(eyes) == 1:
-            # Só detectou um olho, analisa ele
-            eye_bbox = eyes[0]
-            try:
-                ey, ex, ew, eh = eye_bbox
-                if ey >= 0 and ex >= 0 and ey + eh <= eye_region_full.shape[0] and ex + ew <= eye_region_full.shape[1]:
-                    eye_region = eye_region_full[
-                        ey:ey+eh,
-                        ex:ex+ew
-                    ]
-                    if eye_region.size > 0:
-                        state, conf = self.detect_eye_state(eye_region)
-                    else:
-                        state, conf = 'unknown', 0.0
-                else:
-                    state, conf = 'unknown', 0.0
-            except Exception as e:
-                print(f"Erro ao processar olho único: {e}")
-                state, conf = 'unknown', 0.0
-            left_eye_state = state
-            right_eye_state = state
-            left_eye_conf = conf
-            right_eye_conf = conf
-        
+                        right_eye_state, right_eye_conf = state, conf
+                if len(eyes) == 1:
+                    right_eye_state, right_eye_conf = left_eye_state, left_eye_conf
+
+        eyes_open = (
+            left_eye_state == 'open' and right_eye_state == 'open'
+        ) or (
+            # Aceita um open + partial se confiança razoável
+            {left_eye_state, right_eye_state} <= {'open', 'partial'}
+            and 'open' in (left_eye_state, right_eye_state)
+            and min(left_eye_conf, right_eye_conf) >= 0.45
+        )
+
+        # Se ambos unknown, não libera captura
+        if left_eye_state == 'unknown' and right_eye_state == 'unknown':
+            eyes_open = False
+
         return {
-            'glasses': has_glasses,
+            'glasses': bool(has_glasses),
             'glasses_confidence': float(glasses_confidence),
             'left_eye': left_eye_state,
             'right_eye': right_eye_state,
             'left_eye_confidence': float(left_eye_conf),
             'right_eye_confidence': float(right_eye_conf),
-            'eyes_detected': len(eyes)
+            'eyes_open': bool(eyes_open),
+            'eyes_detected': int(eyes_count),
         }
-    
-    def analyze_full_face(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Dict:
+
+    def analyze_full_face(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int],
+                          landmarks: Optional[Dict] = None) -> Dict:
         """
-        Análise completa do rosto incluindo óculos, olhos, e outras características
-        
-        Args:
-            face_image: Imagem completa
-            face_bbox: Bounding box do rosto (x, y, w, h)
-            
-        Returns:
-            Dicionário com todas as características detectadas
+        Análise completa: olhos, óculos, chapéu e qualidade.
         """
-        analysis = self.analyze_eyes(face_image, face_bbox)
-        
-        # Adiciona informações adicionais
+        analysis = self.analyze_eyes(face_image, face_bbox, landmarks=landmarks)
+        has_hat, hat_confidence = self.detect_hat(face_image, face_bbox)
+
         x, y, w, h = face_bbox
-        face_region = face_image[y:y+h, x:x+w]
-        
+        face_region = face_image[y:y + h, x:x + w]
+
+        if face_region.size == 0:
+            analysis.update({
+                'hat': False,
+                'hat_confidence': 0.0,
+                'accessories': [],
+                'brightness': 0.0,
+                'sharpness': 0.0,
+                'quality': 'poor',
+                'capture_ready': False,
+                'capture_blockers': ['rosto inválido'],
+            })
+            return analysis
+
         if len(face_region.shape) == 3:
             gray_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
         else:
             gray_face = face_region.copy()
-        
-        # Análise de iluminação
-        mean_brightness = np.mean(gray_face)
-        brightness_std = np.std(gray_face)
-        
-        # Análise de qualidade
-        # Calcula nitidez (variação de gradiente)
+
+        mean_brightness = float(np.mean(gray_face))
         grad_x = cv2.Sobel(gray_face, cv2.CV_64F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(gray_face, cv2.CV_64F, 0, 1, ksize=3)
-        sharpness = np.mean(np.sqrt(grad_x**2 + grad_y**2))
-        
+        sharpness = float(np.mean(np.sqrt(grad_x ** 2 + grad_y ** 2)))
+
+        accessories = []
+        if analysis.get('glasses'):
+            accessories.append('óculos')
+        if has_hat:
+            accessories.append('chapéu/boné')
+
+        blockers = []
+        if not analysis.get('eyes_open'):
+            if analysis.get('left_eye') == 'closed' or analysis.get('right_eye') == 'closed':
+                blockers.append('abra os olhos')
+            else:
+                blockers.append('olhos não confirmados')
+        if mean_brightness < 40:
+            blockers.append('pouca luz')
+        if mean_brightness > 220:
+            blockers.append('muita luz')
+        if sharpness < 18:
+            blockers.append('imagem borrada')
+
         analysis.update({
-            'brightness': float(mean_brightness),
-            'brightness_std': float(brightness_std),
-            'sharpness': float(sharpness),
-            'quality': 'good' if sharpness > 30 and 50 < mean_brightness < 200 else 'poor'
+            'hat': bool(has_hat),
+            'hat_confidence': float(hat_confidence),
+            'accessories': accessories,
+            'brightness': mean_brightness,
+            'brightness_std': float(np.std(gray_face)),
+            'sharpness': sharpness,
+            'quality': 'good' if sharpness > 30 and 50 < mean_brightness < 200 else 'poor',
+            'capture_ready': len(blockers) == 0 and analysis.get('eyes_open', False),
+            'capture_blockers': blockers,
         })
-        
+
         return analysis
