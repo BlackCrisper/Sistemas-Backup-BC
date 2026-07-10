@@ -1,0 +1,404 @@
+{% extends "base.html" %}
+
+{% block title %}Reconhecer — FaceID{% endblock %}
+{% block topbar_title %}Reconhecer{% endblock %}
+
+{% block content %}
+<div class="page-header page-header-compact">
+    <h2>Reconhecer</h2>
+    <p>Aponte a câmera para o rosto.</p>
+</div>
+
+<div class="panel recognize-layout panel-wide">
+    <div class="camera-stage" id="cameraStage">
+        <div class="camera-placeholder" id="cameraPlaceholder">Câmera desligada</div>
+        <video id="video" autoplay playsinline muted style="display:none;"></video>
+        <canvas id="overlay" style="display:none;"></canvas>
+        <canvas id="canvas" style="display:none;"></canvas>
+        <img id="resultImage" alt="Resultado" style="display:none;">
+    </div>
+
+    <div class="btn-row">
+        <button type="button" id="startWebcam" class="btn btn-primary">Iniciar câmera</button>
+        <button type="button" id="stopWebcam" class="btn btn-secondary" style="display:none;">Parar</button>
+        <button type="button" id="uploadBtn" class="btn btn-secondary">Enviar imagem</button>
+        <input type="file" id="imageInput" accept="image/*" hidden>
+    </div>
+
+    <div id="statusBar" class="status-bar"></div>
+    <div id="results" class="results"></div>
+    <div id="message" class="message" style="display:none;"></div>
+</div>
+
+<div id="matchModal" class="match-modal" hidden aria-hidden="true">
+    <div class="match-modal-backdrop"></div>
+    <div class="match-modal-card" role="dialog" aria-modal="true" aria-labelledby="matchName">
+        <div class="match-check" aria-hidden="true">
+            <svg viewBox="0 0 52 52">
+                <circle class="match-check-circle" cx="26" cy="26" r="24" fill="none"/>
+                <path class="match-check-mark" fill="none" d="M14 27l8 8 16-16"/>
+            </svg>
+        </div>
+        <p class="match-label">Identificado</p>
+        <h2 id="matchName" class="match-name">—</h2>
+        <p id="matchConfidence" class="match-confidence"></p>
+        <button type="button" id="closeMatchModal" class="btn btn-primary match-close">Fechar</button>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const MATCH_THRESHOLD = 0.80;
+let stream = null;
+let recognitionInterval = null;
+let isProcessing = false;
+let matchModalOpen = false;
+let lastShownMatchId = null;
+
+function setStatus(text, type = '') {
+    const el = document.getElementById('statusBar');
+    el.textContent = text || '';
+    el.className = 'status-bar' + (type ? ' ' + type : '');
+}
+
+function showMessage(text, type) {
+    const el = document.getElementById('message');
+    if (!text) {
+        el.style.display = 'none';
+        return;
+    }
+    el.textContent = text;
+    el.className = 'message ' + type;
+    el.style.display = 'block';
+}
+
+function showMatchModal(nome, confidence, usuarioId) {
+    if (matchModalOpen) return;
+    if (lastShownMatchId === usuarioId) return;
+
+    matchModalOpen = true;
+    lastShownMatchId = usuarioId;
+
+    const modal = document.getElementById('matchModal');
+    document.getElementById('matchName').textContent = nome;
+    document.getElementById('matchConfidence').textContent =
+        `${(confidence * 100).toFixed(0)}% de confiança`;
+
+    modal.hidden = false;
+    modal.setAttribute('aria-hidden', 'false');
+    // Reinicia animação do check
+    modal.classList.remove('is-open');
+    void modal.offsetWidth;
+    requestAnimationFrame(() => modal.classList.add('is-open'));
+    document.body.classList.add('modal-open');
+
+    if (recognitionInterval) {
+        clearInterval(recognitionInterval);
+        recognitionInterval = null;
+    }
+}
+
+function closeMatchModal() {
+    const modal = document.getElementById('matchModal');
+    modal.classList.remove('is-open');
+    document.body.classList.remove('modal-open');
+
+    setTimeout(() => {
+        modal.hidden = true;
+        modal.setAttribute('aria-hidden', 'true');
+        matchModalOpen = false;
+        lastShownMatchId = null;
+
+        const video = document.getElementById('video');
+        if (stream && video.srcObject && !recognitionInterval) {
+            recognitionInterval = setInterval(recognizeFromVideo, 1200);
+            setStatus('Câmera ativa. Reconhecendo...');
+        }
+    }, 280);
+}
+
+function maybeShowMatch(results) {
+    if (!results || matchModalOpen) return;
+    const best = results
+        .filter(r => r.usuario_id && typeof r.confidence === 'number')
+        .sort((a, b) => b.confidence - a.confidence)[0];
+
+    if (best && best.confidence >= MATCH_THRESHOLD) {
+        showMatchModal(best.nome, best.confidence, best.usuario_id);
+    }
+}
+
+document.getElementById('closeMatchModal').addEventListener('click', closeMatchModal);
+document.querySelector('.match-modal-backdrop').addEventListener('click', closeMatchModal);
+
+function cameraErrorMessage(error) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return 'Este navegador não suporta câmera. Use Chrome/Edge em HTTPS.';
+    }
+    switch (error.name) {
+        case 'NotAllowedError':
+        case 'PermissionDeniedError':
+            return 'Permissão da câmera negada.';
+        case 'NotFoundError':
+        case 'DevicesNotFoundError':
+            return 'Nenhuma câmera encontrada.';
+        case 'NotReadableError':
+        case 'TrackStartError':
+            return 'Câmera em uso por outro aplicativo.';
+        case 'SecurityError':
+            return 'Acesso bloqueado. Use HTTPS.';
+        default:
+            return 'Erro ao acessar câmera: ' + (error.message || error.name || 'desconhecido');
+    }
+}
+
+async function startCamera(videoEl) {
+    if (!navigator.mediaDevices?.getUserMedia) {
+        throw Object.assign(new Error('getUserMedia indisponível'), { name: 'NotSupportedError' });
+    }
+    const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+            facingMode: 'user',
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+        }
+    });
+    videoEl.srcObject = mediaStream;
+    videoEl.style.display = 'block';
+    await videoEl.play();
+    return mediaStream;
+}
+
+function stopWebcam() {
+    if (recognitionInterval) {
+        clearInterval(recognitionInterval);
+        recognitionInterval = null;
+    }
+    if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+    }
+    const video = document.getElementById('video');
+    video.srcObject = null;
+    video.style.display = 'none';
+    document.getElementById('overlay').style.display = 'none';
+    document.getElementById('cameraPlaceholder').style.display = 'block';
+    document.getElementById('cameraStage').classList.remove('is-active');
+    document.getElementById('startWebcam').style.display = 'inline-flex';
+    document.getElementById('stopWebcam').style.display = 'none';
+    isProcessing = false;
+}
+
+document.getElementById('startWebcam').addEventListener('click', async () => {
+    const video = document.getElementById('video');
+    showMessage('', '');
+    setStatus('Solicitando acesso à câmera...');
+    lastShownMatchId = null;
+
+    try {
+        document.getElementById('resultImage').style.display = 'none';
+        document.getElementById('results').innerHTML = '';
+
+        stream = await startCamera(video);
+        document.getElementById('cameraPlaceholder').style.display = 'none';
+        document.getElementById('cameraStage').classList.add('is-active');
+        document.getElementById('startWebcam').style.display = 'none';
+        document.getElementById('stopWebcam').style.display = 'inline-flex';
+        setStatus('Câmera ativa. Reconhecendo...');
+
+        recognitionInterval = setInterval(recognizeFromVideo, 1200);
+    } catch (error) {
+        console.error(error);
+        setStatus(cameraErrorMessage(error), 'error');
+    }
+});
+
+document.getElementById('stopWebcam').addEventListener('click', () => {
+    stopWebcam();
+    setStatus('Câmera desligada.');
+});
+
+document.getElementById('uploadBtn').addEventListener('click', () => {
+    document.getElementById('imageInput').click();
+});
+
+document.getElementById('imageInput').addEventListener('change', (e) => {
+    if (e.target.files.length > 0) {
+        stopWebcam();
+        lastShownMatchId = null;
+        recognizeFromFile(e.target.files[0]);
+    }
+});
+
+async function recognizeFromVideo() {
+    if (isProcessing || matchModalOpen) return;
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    if (!video.srcObject || video.readyState < 2 || video.videoWidth === 0) return;
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    await recognizeImageRealtime(canvas.toDataURL('image/jpeg', 0.75), video);
+}
+
+async function recognizeImageRealtime(imageData, video) {
+    if (isProcessing || matchModalOpen) return;
+    isProcessing = true;
+
+    const overlay = document.getElementById('overlay');
+    const formData = new FormData();
+    formData.append('imagem_base64', imageData);
+    formData.append('stream', '1');
+
+    try {
+        const response = await fetch('{{ url_for("recognize") }}', {
+            method: 'POST',
+            body: formData
+        });
+
+        let data;
+        try {
+            data = await response.json();
+        } catch (_) {
+            setStatus('Resposta inválida do servidor.', 'error');
+            return;
+        }
+
+        if (!response.ok || !data.success) {
+            setStatus(data.error || ('Erro ' + response.status), 'error');
+            return;
+        }
+
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+        overlay.style.display = 'block';
+
+        const ctx = overlay.getContext('2d');
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+        const results = data.results || [];
+        if (results.length === 0) {
+            setStatus('Nenhum rosto detectado.');
+            renderResults([]);
+            return;
+        }
+
+        let recognized = 0;
+        const maxSide = Math.max(video.videoWidth, video.videoHeight);
+        const serverScale = maxSide > 480 ? 480 / maxSide : 1;
+
+        results.forEach((result) => {
+            let [x, y, w, h] = result.location;
+            x /= serverScale;
+            y /= serverScale;
+            w /= serverScale;
+            h /= serverScale;
+            const known = !!result.usuario_id;
+            if (known) recognized += 1;
+
+            ctx.strokeStyle = known ? '#067647' : '#b54708';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x, y, w, h);
+
+            const label = known
+                ? `${result.nome} (${(result.confidence * 100).toFixed(0)}%)`
+                : 'Desconhecido';
+
+            ctx.font = '14px DM Sans, sans-serif';
+            const tw = ctx.measureText(label).width + 10;
+            ctx.fillStyle = known ? '#067647' : '#b54708';
+            ctx.fillRect(x, Math.max(0, y - 22), tw, 22);
+            ctx.fillStyle = '#fff';
+            ctx.fillText(label, x + 5, Math.max(14, y - 6));
+        });
+
+        setStatus(`${results.length} rosto(s) · ${recognized} reconhecido(s)`);
+        renderResults(results);
+        maybeShowMatch(results);
+    } catch (error) {
+        console.error(error);
+        setStatus('Falha na requisição: ' + error.message, 'error');
+    } finally {
+        isProcessing = false;
+    }
+}
+
+function renderResults(results) {
+    const resultsDiv = document.getElementById('results');
+    resultsDiv.innerHTML = '';
+    if (!results || results.length === 0) return;
+
+    const list = document.createElement('div');
+    list.className = 'results-list';
+
+    results.forEach((result) => {
+        const item = document.createElement('div');
+        if (result.usuario_id) {
+            item.className = 'result-item recognized';
+            item.innerHTML = `<strong>${result.nome}</strong><span>${(result.confidence * 100).toFixed(1)}%</span>`;
+        } else {
+            item.className = 'result-item unknown';
+            item.innerHTML = '<strong>Desconhecido</strong>';
+        }
+        list.appendChild(item);
+    });
+
+    resultsDiv.appendChild(list);
+}
+
+async function recognizeFromFile(file) {
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+        await recognizeImage(e.target.result);
+    };
+    reader.readAsDataURL(file);
+}
+
+async function recognizeImage(imageData) {
+    const formData = new FormData();
+    formData.append('imagem_base64', imageData);
+    const resultImage = document.getElementById('resultImage');
+
+    setStatus('Processando imagem...');
+    showMessage('', '');
+
+    try {
+        const response = await fetch('{{ url_for("recognize") }}', {
+            method: 'POST',
+            body: formData
+        });
+        const data = await response.json();
+
+        if (!response.ok || !data.success) {
+            showMessage(data.error || 'Erro ao processar imagem', 'error');
+            setStatus('', 'error');
+            return;
+        }
+
+        document.getElementById('cameraPlaceholder').style.display = 'none';
+        document.getElementById('video').style.display = 'none';
+        document.getElementById('overlay').style.display = 'none';
+
+        if (data.image) {
+            resultImage.src = data.image;
+            resultImage.style.display = 'block';
+        }
+
+        const results = data.results || [];
+        renderResults(results);
+        const count = results.length;
+        setStatus(count ? `${count} rosto(s) processado(s)` : 'Nenhum rosto detectado', count ? 'success' : '');
+        maybeShowMatch(results);
+    } catch (error) {
+        showMessage('Erro: ' + error.message, 'error');
+        setStatus('', 'error');
+    }
+}
+
+window.addEventListener('beforeunload', stopWebcam);
+</script>
+{% endblock %}

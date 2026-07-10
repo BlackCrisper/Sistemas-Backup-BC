@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}Início — FaceID{% endblock %}
+{% block topbar_title %}Início{% endblock %}
+
+{% block content %}
+<section class="home-hero">
+    <p class="home-kicker">Sistema facial</p>
+    <h2>Olá</h2>
+    <p>Cadastre pessoas e reconheça pela câmera.</p>
+</section>
+
+<div class="actions-row">
+    <a href="{{ url_for('register') }}" class="action-link action-primary">
+        <span class="action-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Zm0 2c-4.4 0-8 2.2-8 5v1h16v-1c0-2.8-3.6-5-8-5Zm7-7h-2V5h-2v2h-2v2h2v2h2V9h2V7Z"/></svg>
+        </span>
+        <strong>Cadastrar</strong>
+        <span>Nova pessoa</span>
+    </a>
+    <a href="{{ url_for('recognize') }}" class="action-link">
+        <span class="action-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M4 7V4h3V2H2v5h2Zm14-3h3v3h2V2h-5v2ZM7 22H2v-5h2v3h3v2Zm15-5v5h-5v-2h3v-3h2ZM8 8h8v8H8V8Zm2 2v4h4v-4h-4Z"/></svg>
+        </span>
+        <strong>Reconhecer</strong>
+        <span>Tempo real</span>
+    </a>
+</div>
+
+<section class="panel panel-list">
+    <div class="panel-head">
+        <h3 class="panel-title">Usuários</h3>
+        <span class="panel-count">{{ usuarios|length }}</span>
+    </div>
+    {% if usuarios %}
+    <div class="usuarios-list">
+        {% for usuario in usuarios %}
+        <div class="usuario-item">
+            <div class="usuario-avatar" aria-hidden="true">{{ usuario.nome[:1]|upper }}</div>
+            <div class="usuario-info">
+                <strong>{{ usuario.nome }}</strong>
+                <span class="meta">
+                    {% if usuario.cpf %}CPF {{ usuario.cpf }} · {% endif %}
+                    {{ usuario.data_cadastro }}
+                </span>
+            </div>
+            <button type="button" class="btn btn-danger" onclick="deleteUser({{ usuario.id }}, '{{ usuario.nome|e }}')">
+                Remover
+            </button>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="no-data">Nenhum usuário ainda.<br>Toque em Cadastrar para começar.</p>
+    {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function deleteUser(userId, userName) {
+    if (!confirm(`Remover "${userName}"?`)) return;
+    try {
+        const response = await fetch(`/api/users/${userId}`, { method: 'DELETE' });
+        const data = await response.json();
+        if (data.success) location.reload();
+        else alert(data.error || 'Erro ao remover usuário');
+    } catch (error) {
+        alert('Erro: ' + error.message);
+    }
+}
+</script>
+{% endblock %}

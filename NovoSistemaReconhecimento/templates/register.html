@@ -1,0 +1,360 @@
+{% extends "base.html" %}
+
+{% block title %}Cadastrar — FaceID{% endblock %}
+{% block topbar_title %}Cadastrar{% endblock %}
+
+{% block content %}
+<div class="page-header page-header-compact">
+    <h2>Novo usuário</h2>
+    <p>3 fotos do rosto para melhor precisão.</p>
+</div>
+
+<div class="panel panel-wide">
+    <form id="registerForm" enctype="multipart/form-data">
+        <div class="form-group">
+            <label for="nome">Nome</label>
+            <input type="text" id="nome" name="nome" required placeholder="Nome completo" autocomplete="name">
+        </div>
+
+        <div class="form-group">
+            <label for="cpf">CPF <span style="font-weight:400;color:var(--text-muted)">(opcional)</span></label>
+            <input type="text" id="cpf" name="cpf" placeholder="000.000.000-00" inputmode="numeric">
+        </div>
+
+        <div class="form-group">
+            <label>Capturas <span id="captureCountLabel" style="font-weight:400;color:var(--text-muted)">0/3</span></label>
+            <div class="camera-stage" id="cameraStage">
+                <div class="camera-placeholder" id="cameraPlaceholder">Câmera desligada</div>
+                <video id="video" autoplay playsinline muted style="display:none;"></video>
+                <canvas id="canvas" style="display:none;"></canvas>
+                <canvas id="overlayCanvas" style="display:none;"></canvas>
+                <div id="faceGuide" class="face-guide" style="display:none;">
+                    <div class="guide-frame"></div>
+                    <div class="guide-text" id="guideText">Centralize o rosto</div>
+                </div>
+            </div>
+
+            <div id="thumbs" class="thumbs" style="display:none;"></div>
+
+            <div class="capture-controls">
+                <button type="button" id="startWebcamBtn" class="btn btn-primary">Iniciar câmera</button>
+                <button type="button" id="stopWebcamBtn" class="btn btn-secondary" style="display:none;">Parar</button>
+                <button type="button" id="captureBtn" class="btn btn-secondary" style="display:none;">Capturar</button>
+                <button type="button" id="clearCapturesBtn" class="btn btn-secondary" style="display:none;">Limpar fotos</button>
+            </div>
+            <div id="cameraStatus" class="status-bar"></div>
+
+            <div class="upload-alt">
+                <label for="imagem">Ou enviar 1 imagem</label>
+                <input type="file" id="imagem" name="imagem" accept="image/*">
+            </div>
+        </div>
+
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary" id="submitBtn" disabled>Cadastrar</button>
+            <a href="{{ url_for('index') }}" class="btn btn-secondary">Cancelar</a>
+        </div>
+
+        <div id="message" class="message" style="display:none;"></div>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+.thumbs {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-top: 12px;
+}
+.thumbs img {
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+}
+</style>
+<script>
+const REQUIRED_CAPTURES = 3;
+let stream = null;
+let detectInterval = null;
+let isDetecting = false;
+let captures = [];
+let lastCaptureAt = 0;
+
+function setStatus(text, type = '') {
+    const el = document.getElementById('cameraStatus');
+    el.textContent = text || '';
+    el.className = 'status-bar' + (type ? ' ' + type : '');
+}
+
+function updateCaptureUI() {
+    document.getElementById('captureCountLabel').textContent = `${captures.length}/${REQUIRED_CAPTURES}`;
+    const thumbs = document.getElementById('thumbs');
+    thumbs.innerHTML = '';
+    if (captures.length) {
+        thumbs.style.display = 'grid';
+        captures.forEach((src) => {
+            const img = document.createElement('img');
+            img.src = src;
+            img.alt = 'Captura';
+            thumbs.appendChild(img);
+        });
+        document.getElementById('clearCapturesBtn').style.display = 'inline-flex';
+    } else {
+        thumbs.style.display = 'none';
+        document.getElementById('clearCapturesBtn').style.display = 'none';
+    }
+    document.getElementById('submitBtn').disabled = captures.length < 1 && !document.getElementById('imagem').files.length;
+    if (captures.length >= REQUIRED_CAPTURES) {
+        setStatus(`${REQUIRED_CAPTURES} fotos capturadas. Pode cadastrar.`, 'success');
+        document.getElementById('submitBtn').disabled = false;
+    }
+}
+
+function cameraErrorMessage(error) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return 'Este navegador não suporta câmera. Use Chrome/Edge em HTTPS.';
+    }
+    switch (error.name) {
+        case 'NotAllowedError':
+        case 'PermissionDeniedError':
+            return 'Permissão da câmera negada.';
+        case 'NotFoundError':
+            return 'Nenhuma câmera encontrada.';
+        case 'NotReadableError':
+            return 'Câmera em uso por outro aplicativo.';
+        case 'SecurityError':
+            return 'Acesso bloqueado. Use HTTPS.';
+        default:
+            return 'Erro ao acessar câmera: ' + (error.message || error.name);
+    }
+}
+
+async function startCamera(videoEl) {
+    if (!navigator.mediaDevices?.getUserMedia) {
+        throw Object.assign(new Error('getUserMedia indisponível'), { name: 'NotSupportedError' });
+    }
+    const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+    });
+    videoEl.srcObject = mediaStream;
+    videoEl.style.display = 'block';
+    await videoEl.play();
+    return mediaStream;
+}
+
+function stopCamera() {
+    if (detectInterval) {
+        clearInterval(detectInterval);
+        detectInterval = null;
+    }
+    if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+    }
+    const video = document.getElementById('video');
+    video.srcObject = null;
+    video.style.display = 'none';
+    document.getElementById('overlayCanvas').style.display = 'none';
+    document.getElementById('faceGuide').style.display = 'none';
+    document.getElementById('cameraPlaceholder').style.display = 'block';
+    document.getElementById('cameraStage').classList.remove('is-active');
+    document.getElementById('startWebcamBtn').style.display = 'inline-flex';
+    document.getElementById('stopWebcamBtn').style.display = 'none';
+    document.getElementById('captureBtn').style.display = 'none';
+}
+
+document.getElementById('startWebcamBtn').addEventListener('click', async () => {
+    const video = document.getElementById('video');
+    setStatus('Solicitando acesso à câmera...');
+    try {
+        stream = await startCamera(video);
+        document.getElementById('cameraPlaceholder').style.display = 'none';
+        document.getElementById('cameraStage').classList.add('is-active');
+        document.getElementById('faceGuide').style.display = 'block';
+        document.getElementById('startWebcamBtn').style.display = 'none';
+        document.getElementById('stopWebcamBtn').style.display = 'inline-flex';
+        document.getElementById('captureBtn').style.display = 'inline-flex';
+        setStatus(`Câmera ativa. Capture ${REQUIRED_CAPTURES} fotos.`);
+        detectInterval = setInterval(detectAndGuideFace, 450);
+    } catch (error) {
+        console.error(error);
+        setStatus(cameraErrorMessage(error), 'error');
+    }
+});
+
+document.getElementById('stopWebcamBtn').addEventListener('click', () => {
+    stopCamera();
+    setStatus('Câmera desligada.');
+});
+
+document.getElementById('clearCapturesBtn').addEventListener('click', () => {
+    captures = [];
+    updateCaptureUI();
+    setStatus('Fotos limpas. Capture novamente.');
+});
+
+async function detectAndGuideFace() {
+    if (isDetecting || captures.length >= REQUIRED_CAPTURES) return;
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const overlayCanvas = document.getElementById('overlayCanvas');
+    const guideText = document.getElementById('guideText');
+    const faceGuide = document.getElementById('faceGuide');
+
+    if (!video.srcObject || video.readyState < 2 || video.videoWidth === 0) return;
+
+    isDetecting = true;
+    try {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+
+        const formData = new FormData();
+        formData.append('imagem_base64', canvas.toDataURL('image/jpeg', 0.65));
+
+        const response = await fetch('{{ url_for("api_detect") }}', { method: 'POST', body: formData });
+        const data = await response.json();
+
+        overlayCanvas.width = video.videoWidth;
+        overlayCanvas.height = video.videoHeight;
+        const ctx = overlayCanvas.getContext('2d');
+        ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+        if (data.success && data.results?.length > 0) {
+            const [x, y, w, h] = data.results[0].location;
+            overlayCanvas.style.display = 'block';
+            ctx.strokeStyle = '#3dd68c';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x, y, w, h);
+
+            const faceCenterX = x + w / 2;
+            const faceCenterY = y + h / 2;
+            const offsetX = Math.abs(faceCenterX - video.videoWidth / 2);
+            const offsetY = Math.abs(faceCenterY - video.videoHeight / 2);
+            const maxOffset = Math.min(video.videoWidth, video.videoHeight) * 0.2;
+            const faceHeightRatio = h / video.videoHeight;
+            const sizeOK = faceHeightRatio >= 0.2 && faceHeightRatio <= 0.65;
+            const centered = offsetX < maxOffset && offsetY < maxOffset;
+
+            if (centered && sizeOK) {
+                faceGuide.classList.add('ready');
+                guideText.textContent = `Foto ${captures.length + 1}/${REQUIRED_CAPTURES} — aguarde...`;
+                const now = Date.now();
+                if (now - lastCaptureAt > 1600) {
+                    lastCaptureAt = now;
+                    takeCapture();
+                }
+            } else {
+                faceGuide.classList.remove('ready');
+                if (!centered) {
+                    guideText.textContent = faceCenterX < video.videoWidth / 2 ? 'Mova para a direita' : 'Mova para a esquerda';
+                } else {
+                    guideText.textContent = faceHeightRatio < 0.2 ? 'Aproxime-se' : 'Afaste-se um pouco';
+                }
+            }
+        } else {
+            overlayCanvas.style.display = 'none';
+            faceGuide.classList.remove('ready');
+            guideText.textContent = 'Nenhum rosto detectado';
+        }
+    } catch (error) {
+        console.error(error);
+    } finally {
+        isDetecting = false;
+    }
+}
+
+function takeCapture() {
+    if (captures.length >= REQUIRED_CAPTURES) return;
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    if (!video || video.readyState < 2) return;
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    captures.push(canvas.toDataURL('image/jpeg', 0.92));
+    updateCaptureUI();
+
+    if (captures.length >= REQUIRED_CAPTURES) {
+        document.getElementById('guideText').textContent = 'Pronto!';
+        stopCamera();
+    } else {
+        setStatus(`Captura ${captures.length}/${REQUIRED_CAPTURES}. Mova levemente a cabeça e aguarde.`);
+    }
+}
+
+document.getElementById('captureBtn').addEventListener('click', () => {
+    lastCaptureAt = Date.now();
+    takeCapture();
+});
+
+document.getElementById('imagem').addEventListener('change', (e) => {
+    if (!e.target.files.length) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+        stopCamera();
+        captures = [ev.target.result];
+        updateCaptureUI();
+        setStatus('Imagem carregada. Ideal: use 3 fotos pela câmera.', 'success');
+        document.getElementById('submitBtn').disabled = false;
+    };
+    reader.readAsDataURL(e.target.files[0]);
+});
+
+document.getElementById('registerForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const messageDiv = document.getElementById('message');
+    messageDiv.style.display = 'none';
+
+    const formData = new FormData();
+    formData.append('nome', document.getElementById('nome').value.trim());
+    formData.append('cpf', document.getElementById('cpf').value.trim());
+
+    if (captures.length) {
+        captures.forEach((src, i) => formData.append(`imagem_base64_${i}`, src));
+    } else if (document.getElementById('imagem').files.length) {
+        formData.append('imagem', document.getElementById('imagem').files[0]);
+    } else {
+        messageDiv.textContent = 'Capture ao menos 1 foto (recomendado: 3).';
+        messageDiv.className = 'message error';
+        messageDiv.style.display = 'block';
+        return;
+    }
+
+    const submitBtn = document.getElementById('submitBtn');
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Processando...';
+
+    try {
+        const response = await fetch('{{ url_for("register") }}', { method: 'POST', body: formData });
+        const data = await response.json();
+        if (data.success) {
+            messageDiv.textContent = data.message || 'Usuário cadastrado.';
+            messageDiv.className = 'message success';
+            messageDiv.style.display = 'block';
+            setTimeout(() => { window.location.href = '{{ url_for("index") }}'; }, 1200);
+        } else {
+            messageDiv.textContent = data.error || 'Erro ao cadastrar.';
+            messageDiv.className = 'message error';
+            messageDiv.style.display = 'block';
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Cadastrar';
+        }
+    } catch (error) {
+        messageDiv.textContent = 'Erro: ' + error.message;
+        messageDiv.className = 'message error';
+        messageDiv.style.display = 'block';
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Cadastrar';
+    }
+});
+
+window.addEventListener('beforeunload', stopCamera);
+</script>
+{% endblock %}
