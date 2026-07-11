@@ -121,15 +121,36 @@ def register():
             filepath = os.path.join(user_dir, f'face_{usuario_id}_{idx}.jpg')
             cv2.imwrite(filepath, image)
 
-            faces = face_recognizer.detect_faces(image)
-            if not faces:
+            detailed = face_recognizer.detect_faces_detailed(image)
+            if not detailed:
                 last_error = 'Nenhum rosto detectado. Centralize o rosto e melhore a iluminação.'
                 continue
-            if len(faces) > 1:
+            if len(detailed) > 1:
                 last_error = 'Múltiplos rostos detectados. Cadastre uma pessoa por vez.'
                 continue
 
-            success, message = face_recognizer.validate_and_add_face(usuario_id, image, faces[0])
+            face = detailed[0]
+            try:
+                facial_info = facial_analysis.analyze_full_face(
+                    image, face['location'], landmarks=face.get('landmarks')
+                )
+            except Exception as e:
+                print(f'Erro análise no cadastro: {e}')
+                facial_info = {'capture_blockers': ['falha na análise'], 'capture_ready': False}
+
+            if facial_info.get('sunglasses'):
+                last_error = 'Remova os óculos escuros para cadastrar.'
+                continue
+            if facial_info.get('hat'):
+                last_error = 'Remova chapéu/boné para cadastrar.'
+                continue
+            if facial_info.get('capture_blockers'):
+                last_error = 'Corrija: ' + ', '.join(facial_info['capture_blockers'])
+                continue
+
+            success, message = face_recognizer.validate_and_add_face(
+                usuario_id, image, face['location']
+            )
             if success:
                 added += 1
             else:
@@ -189,7 +210,7 @@ def recognize():
         # Reduz resolução no stream para ganhar velocidade
         if stream_mode:
             h, w = image.shape[:2]
-            max_side = 480
+            max_side = 640
             if max(h, w) > max_side:
                 scale = max_side / float(max(h, w))
                 image = cv2.resize(image, (int(w * scale), int(h * scale)))
@@ -298,6 +319,7 @@ def api_detect():
             facial_info = {
                 'glasses': False,
                 'hat': False,
+                'sunglasses': False,
                 'eyes_open': False,
                 'left_eye': 'unknown',
                 'right_eye': 'unknown',
@@ -315,6 +337,8 @@ def api_detect():
             'facial_analysis': {
                 'glasses': bool(facial_info.get('glasses', False)),
                 'glasses_confidence': float(facial_info.get('glasses_confidence', 0.0)),
+                'sunglasses': bool(facial_info.get('sunglasses', False)),
+                'sunglasses_confidence': float(facial_info.get('sunglasses_confidence', 0.0)),
                 'hat': bool(facial_info.get('hat', False)),
                 'hat_confidence': float(facial_info.get('hat_confidence', 0.0)),
                 'left_eye': str(facial_info.get('left_eye', 'unknown')),

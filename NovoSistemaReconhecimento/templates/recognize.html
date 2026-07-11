@@ -49,12 +49,15 @@
 
 {% block scripts %}
 <script>
-const MATCH_THRESHOLD = 0.80;
+const MATCH_THRESHOLD = 0.55;
+const MATCH_STREAK_REQUIRED = 2;
 let stream = null;
 let recognitionInterval = null;
 let isProcessing = false;
 let matchModalOpen = false;
 let lastShownMatchId = null;
+let matchStreakId = null;
+let matchStreakCount = 0;
 
 function setStatus(text, type = '') {
     const el = document.getElementById('statusBar');
@@ -125,7 +128,20 @@ function maybeShowMatch(results) {
         .sort((a, b) => b.confidence - a.confidence)[0];
 
     if (best && best.confidence >= MATCH_THRESHOLD) {
-        showMatchModal(best.nome, best.confidence, best.usuario_id);
+        if (matchStreakId === best.usuario_id) {
+            matchStreakCount += 1;
+        } else {
+            matchStreakId = best.usuario_id;
+            matchStreakCount = 1;
+        }
+        if (matchStreakCount >= MATCH_STREAK_REQUIRED) {
+            matchStreakId = null;
+            matchStreakCount = 0;
+            showMatchModal(best.nome, best.confidence, best.usuario_id);
+        }
+    } else {
+        matchStreakId = null;
+        matchStreakCount = 0;
     }
 }
 
@@ -196,6 +212,8 @@ document.getElementById('startWebcam').addEventListener('click', async () => {
     showMessage('', '');
     setStatus('Solicitando acesso à câmera...');
     lastShownMatchId = null;
+    matchStreakId = null;
+    matchStreakCount = 0;
 
     try {
         document.getElementById('resultImage').style.display = 'none';
@@ -228,6 +246,8 @@ document.getElementById('imageInput').addEventListener('change', (e) => {
     if (e.target.files.length > 0) {
         stopWebcam();
         lastShownMatchId = null;
+        matchStreakId = null;
+        matchStreakCount = 0;
         recognizeFromFile(e.target.files[0]);
     }
 });
@@ -284,12 +304,14 @@ async function recognizeImageRealtime(imageData, video) {
         if (results.length === 0) {
             setStatus('Nenhum rosto detectado.');
             renderResults([]);
+            matchStreakId = null;
+            matchStreakCount = 0;
             return;
         }
 
         let recognized = 0;
         const maxSide = Math.max(video.videoWidth, video.videoHeight);
-        const serverScale = maxSide > 480 ? 480 / maxSide : 1;
+        const serverScale = maxSide > 640 ? 640 / maxSide : 1;
 
         results.forEach((result) => {
             let [x, y, w, h] = result.location;

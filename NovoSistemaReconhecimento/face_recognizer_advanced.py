@@ -47,10 +47,10 @@ def _ensure_model(filename: str, url: str) -> str:
 
 
 class FaceRecognizer:
-    def __init__(self, database: Database, threshold: float = 0.363):
+    def __init__(self, database: Database, threshold: float = 0.40):
         """
         threshold: similaridade cosseno do SFace (oficial ~0.363).
-        Valores maiores = mais rigoroso.
+        Valores maiores = mais rigoroso. 0.40 equilibra estabilidade e falsos positivos.
         """
         self.database = database
         self.threshold = threshold
@@ -258,9 +258,14 @@ class FaceRecognizer:
         second_best = -1.0
 
         for usuario_id, embeddings in self.known_faces.items():
-            # Usa a melhor similaridade entre as amostras do usuário
-            scores = [self.compare_features(features, emb) for emb in embeddings]
-            user_best = max(scores) if scores else -1.0
+            scores = sorted(
+                (self.compare_features(features, emb) for emb in embeddings),
+                reverse=True,
+            )
+            if not scores:
+                continue
+            # Média das 2 melhores similaridades estabiliza ângulo/iluminação
+            user_best = float(np.mean(scores[:2])) if len(scores) >= 2 else float(scores[0])
             if user_best > best_score:
                 second_best = best_score
                 best_score = user_best
@@ -317,17 +322,72 @@ class FaceRecognizer:
             return False, 'Imagem inválida'
 
         h, w = face_image.shape[:2]
-        if w < 80 or h < 80:
+        if w < 100 or h < 100:
             return False, 'Rosto muito pequeno. Aproxime-se da câmera.'
 
         gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY) if len(face_image.shape) == 3 else face_image
         mean_brightness = float(np.mean(gray))
-        if mean_brightness < 35:
+        if mean_brightness < 40:
             return False, 'Imagem muito escura. Melhore a iluminação.'
-        if mean_brightness > 230:
+        if mean_brightness > 220:
             return False, 'Imagem muito clara. Reduza a iluminação.'
 
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        sharpness = float(np.mean(np.sqrt(grad_x ** 2 + grad_y ** 2)))
+        if sharpness < 16:
+            return False, 'Imagem borrada. Segure firme e foque o rosto.'
+
+        pose_ok, pose_msg = self.validate_frontal_pose(landmarks)
+        if not pose_ok:
+            return False, pose_msg
+
         return True, 'OK'
+
+    def validate_frontal_pose(self, landmarks: Optional[Dict]) -> Tuple[bool, str]:
+        """Exige pose frontal aproximada via landmarks YuNet."""
+        if not landmarks:
+            return True, 'OK'  # Haar fallback: não bloqueia por pose
+
+        required = ('left_eye', 'right_eye', 'nose')
+        if not all(k in landmarks for k in required):
+            return True, 'OK'
+
+        lx, ly = landmarks['left_eye']
+        rx, ry = landmarks['right_eye']
+        nx, ny = landmarks['nose']
+
+        eye_dx = abs(lx - rx)
+        if eye_dx < 1e-3:
+            return False, 'Pose inválida. Olhe para a câmera.'
+
+        eye_dy_ratio = abs(ly - ry) / eye_dx
+        if eye_dy_ratio > 0.22:
+            return False, 'Rosto inclinado. Mantenha a cabeça reta.'
+
+        # Nariz deve ficar aproximadamente entre os olhos no eixo X
+        mid_x = (lx + rx) / 2.0
+        nose_offset = abs(nx - mid_x) / eye_dx
+        if nose_offset > 0.28:
+            return False, 'Vire o rosto de frente para a câmera.'
+
+        # Nariz abaixo da linha dos olhos
+        eye_y = (ly + ry) / 2.0
+        if ny < eye_y:
+            return False, 'Ajuste a pose: olhe para a câmera.'
+
+        return True, 'OK'
+
+    def _augment_for_enrollment(self, image: np.ndarray) -> List[np.ndarray]:
+        """Variações leves de brilho/contraste para cobrir iluminação diferente."""
+        variants = [image]
+        try:
+            brighter = cv2.convertScaleAbs(image, alpha=1.08, beta=12)
+            darker = cv2.convertScaleAbs(image, alpha=0.92, beta=-10)
+            variants.extend([brighter, darker])
+        except Exception:
+            pass
+        return variants
 
     def detect_landmarks_advanced(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Optional[Dict]:
         """Compatibilidade com endpoints antigos."""
@@ -362,9 +422,26 @@ class FaceRecognizer:
         if emb is None:
             return False
 
+        saved = 0
+        # Embedding original
         self.database.adicionar_encoding(usuario_id, emb)
         self.known_faces.setdefault(usuario_id, []).append(emb)
-        return True
+        saved += 1
+
+        # Extra: embeddings em variantes de iluminação (redetecta na variante)
+        for variant in self._augment_for_enrollment(face_image)[1:]:
+            v_faces = self.detect_faces_detailed(variant)
+            if not v_faces:
+                continue
+            v_face = max(v_faces, key=lambda f: f['score'])
+            v_emb = self.extract_embedding(variant, v_face)
+            if v_emb is None:
+                continue
+            self.database.adicionar_encoding(usuario_id, v_emb)
+            self.known_faces.setdefault(usuario_id, []).append(v_emb)
+            saved += 1
+
+        return saved > 0
 
     def validate_and_add_face(self, usuario_id: int, image: np.ndarray,
                               face_bbox: Optional[Tuple[int, int, int, int]] = None) -> Tuple[bool, str]:

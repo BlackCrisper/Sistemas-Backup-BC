@@ -107,6 +107,64 @@ class FacialAnalysis:
                     confidence = 0.55
         
         return has_glasses, confidence
+
+    def detect_sunglasses(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int],
+                          landmarks: Optional[Dict] = None) -> Tuple[bool, float]:
+        """
+        Detecta óculos escuros (lentes opacas). Óculos transparentes não bloqueiam.
+        """
+        x, y, w, h = face_bbox
+        if w <= 0 or h <= 0:
+            return False, 0.0
+
+        if len(face_image.shape) == 3:
+            gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = face_image
+
+        patches = []
+        if landmarks and 'left_eye' in landmarks and 'right_eye' in landmarks:
+            for key in ('left_eye', 'right_eye'):
+                patch = self._eye_patch_from_landmark(gray, landmarks[key], w, h)
+                if patch is not None and patch.size > 0:
+                    patches.append(patch)
+
+        if len(patches) < 2:
+            eye_band = gray[y + int(h * 0.18):y + int(h * 0.48), x + int(w * 0.12):x + int(w * 0.88)]
+            if eye_band.size == 0:
+                return False, 0.0
+            mid = eye_band.shape[1] // 2
+            patches = [eye_band[:, :mid], eye_band[:, mid:]]
+
+        cheek = gray[y + int(h * 0.55):y + int(h * 0.75), x + int(w * 0.25):x + int(w * 0.75)]
+        cheek_mean = float(np.mean(cheek)) if cheek.size else 120.0
+
+        dark_scores = []
+        texture_scores = []
+        for patch in patches:
+            if patch.size == 0:
+                continue
+            mean_v = float(np.mean(patch))
+            std_v = float(np.std(patch))
+            dark_ratio = float(np.mean(patch < 55))
+            dark_scores.append(0.0)
+            if mean_v < cheek_mean - 35:
+                dark_scores[-1] += 0.35
+            if mean_v < 70:
+                dark_scores[-1] += 0.35
+            if dark_ratio > 0.45:
+                dark_scores[-1] += 0.30
+            texture_scores.append(1.0 if std_v < 22 else 0.0)
+
+        if not dark_scores:
+            return False, 0.0
+
+        score = float(np.mean(dark_scores))
+        if np.mean(texture_scores) >= 0.5:
+            score += 0.15
+
+        has_sunglasses = score >= 0.55
+        return has_sunglasses, float(min(1.0, score))
     
     def detect_eye_state(self, eye_region: np.ndarray) -> Tuple[str, float]:
         """
@@ -258,6 +316,8 @@ class FacialAnalysis:
             return {
                 'glasses': False,
                 'glasses_confidence': 0.0,
+                'sunglasses': False,
+                'sunglasses_confidence': 0.0,
                 'left_eye': 'unknown',
                 'right_eye': 'unknown',
                 'left_eye_confidence': 0.0,
@@ -277,6 +337,9 @@ class FacialAnalysis:
             gray_full = face_image.copy()
 
         has_glasses, glasses_confidence = self.detect_glasses(face_image, face_bbox)
+        has_sunglasses, sunglasses_confidence = self.detect_sunglasses(
+            face_image, face_bbox, landmarks=landmarks
+        )
 
         left_eye_state = 'unknown'
         right_eye_state = 'unknown'
@@ -334,9 +397,15 @@ class FacialAnalysis:
         if left_eye_state == 'unknown' and right_eye_state == 'unknown':
             eyes_open = False
 
+        # Óculos escuros impedem confirmação confiável dos olhos
+        if has_sunglasses:
+            eyes_open = False
+
         return {
             'glasses': bool(has_glasses),
             'glasses_confidence': float(glasses_confidence),
+            'sunglasses': bool(has_sunglasses),
+            'sunglasses_confidence': float(sunglasses_confidence),
             'left_eye': left_eye_state,
             'right_eye': right_eye_state,
             'left_eye_confidence': float(left_eye_conf),
@@ -360,6 +429,8 @@ class FacialAnalysis:
             analysis.update({
                 'hat': False,
                 'hat_confidence': 0.0,
+                'sunglasses': bool(analysis.get('sunglasses', False)),
+                'sunglasses_confidence': float(analysis.get('sunglasses_confidence', 0.0)),
                 'accessories': [],
                 'brightness': 0.0,
                 'sharpness': 0.0,
@@ -379,14 +450,22 @@ class FacialAnalysis:
         grad_y = cv2.Sobel(gray_face, cv2.CV_64F, 0, 1, ksize=3)
         sharpness = float(np.mean(np.sqrt(grad_x ** 2 + grad_y ** 2)))
 
+        has_sunglasses = bool(analysis.get('sunglasses', False))
+
         accessories = []
-        if analysis.get('glasses'):
+        if has_sunglasses:
+            accessories.append('óculos escuros')
+        elif analysis.get('glasses'):
             accessories.append('óculos')
         if has_hat:
             accessories.append('chapéu/boné')
 
         blockers = []
-        if not analysis.get('eyes_open'):
+        if has_sunglasses:
+            blockers.append('óculos escuros')
+        if has_hat:
+            blockers.append('remova chapéu/boné')
+        if not analysis.get('eyes_open') and not has_sunglasses:
             if analysis.get('left_eye') == 'closed' or analysis.get('right_eye') == 'closed':
                 blockers.append('abra os olhos')
             else:
@@ -401,6 +480,8 @@ class FacialAnalysis:
         analysis.update({
             'hat': bool(has_hat),
             'hat_confidence': float(hat_confidence),
+            'sunglasses': has_sunglasses,
+            'sunglasses_confidence': float(analysis.get('sunglasses_confidence', 0.0)),
             'accessories': accessories,
             'brightness': mean_brightness,
             'brightness_std': float(np.std(gray_face)),
