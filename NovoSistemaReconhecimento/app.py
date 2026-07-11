@@ -122,11 +122,13 @@ def enroll_faces_for_user(usuario_id, images, replace=False):
         if not detailed:
             last_error = 'Nenhum rosto detectado. Centralize o rosto e melhore a iluminação.'
             continue
-        if len(detailed) > 1:
+        face, has_multiple = face_recognizer.select_primary_face(detailed)
+        if has_multiple:
             last_error = 'Múltiplos rostos detectados. Cadastre uma pessoa por vez.'
             continue
-
-        face = detailed[0]
+        if face is None:
+            last_error = 'Nenhum rosto detectado. Centralize o rosto e melhore a iluminação.'
+            continue
         try:
             facial_info = facial_analysis.analyze_full_face(
                 image, face['location'], landmarks=face.get('landmarks')
@@ -376,7 +378,9 @@ def api_detect():
         fx, fy, fw, fh = face['location']
         try:
             facial_info = facial_analysis.analyze_full_face(
-                image, (fx, fy, fw, fh), landmarks=face.get('landmarks')
+                image, (fx, fy, fw, fh),
+                landmarks=face.get('landmarks'),
+                frame_shape=image.shape,
             )
         except Exception as e:
             print(f'Erro análise facial: {e}')
@@ -390,6 +394,10 @@ def api_detect():
                 'accessories': [],
                 'capture_ready': False,
                 'capture_blockers': ['falha na análise'],
+                'checks': [],
+                'scan_progress': 0.0,
+                'brightness': 0.0,
+                'sharpness': 0.0,
             }
 
         results.append({
@@ -412,6 +420,12 @@ def api_detect():
                 'capture_ready': bool(facial_info.get('capture_ready', False)),
                 'capture_blockers': facial_info.get('capture_blockers', []),
                 'quality': str(facial_info.get('quality', 'poor')),
+                'brightness': float(facial_info.get('brightness', 0.0)),
+                'sharpness': float(facial_info.get('sharpness', 0.0)),
+                'pose_ok': bool(facial_info.get('pose_ok', False)),
+                'position_ok': bool(facial_info.get('position_ok', False)),
+                'scan_progress': float(facial_info.get('scan_progress', 0.0)),
+                'checks': facial_info.get('checks', []),
             }
         })
 

@@ -48,7 +48,7 @@
 <section class="panel panel-wide">
     <div class="page-header page-header-compact" style="margin-bottom:12px;">
         <h3 class="panel-title">Refazer cadastro do rosto</h3>
-        <p>3 novas fotos substituem as atuais (olhos abertos, sem óculos escuros/boné).</p>
+        <p>Escaneie o rosto completo antes das 3 fotos (substitui as atuais).</p>
     </div>
 
     <div class="form-group">
@@ -63,7 +63,18 @@
                 <div class="guide-text" id="guideText">Centralize o rosto</div>
             </div>
         </div>
-        <div id="attrChips" class="attr-chips" aria-live="polite"></div>
+        <div id="scanPanel" class="scan-panel" hidden>
+            <div class="scan-progress-wrap">
+                <div class="scan-progress-meta">
+                    <span>Escaneamento</span>
+                    <strong id="scanProgressLabel">0%</strong>
+                </div>
+                <div class="scan-progress">
+                    <div id="scanProgressBar" class="scan-progress-bar"></div>
+                </div>
+            </div>
+            <ul id="scanChecklist" class="scan-checklist" aria-live="polite"></ul>
+        </div>
         <div id="thumbs" class="thumbs" style="display:none;"></div>
         <div class="capture-controls">
             <button type="button" id="startWebcamBtn" class="btn btn-primary">Iniciar câmera</button>
@@ -96,28 +107,22 @@
     border-radius: 8px;
     border: 1px solid var(--border);
 }
-.attr-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-top: 10px;
-    min-height: 28px;
-}
-.attr-chip {
-    font-size: 0.75rem;
-    font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 999px;
-    background: var(--bg-accent);
-    color: var(--text-muted);
-}
-.attr-chip.ok { background: var(--success-soft); color: var(--success); }
-.attr-chip.warn { background: var(--warning-soft); color: var(--warning); }
-.attr-chip.info { background: var(--accent-soft); color: var(--accent); }
 </style>
 <script>
 const USER_ID = {{ usuario.id }};
 const REQUIRED_CAPTURES = 3;
+const READY_STREAK_NEEDED = 3;
+const DEFAULT_CHECKS = [
+    { id: 'face', label: 'Rosto detectado', ok: false, detail: 'procure o rosto' },
+    { id: 'position', label: 'Posição na câmera', ok: false, detail: '—' },
+    { id: 'lighting', label: 'Iluminação', ok: false, detail: '—' },
+    { id: 'sharpness', label: 'Nitidez', ok: false, detail: '—' },
+    { id: 'eyes', label: 'Olhos abertos', ok: false, detail: '—' },
+    { id: 'sunglasses', label: 'Sem óculos escuros', ok: false, detail: '—' },
+    { id: 'hat', label: 'Sem chapéu/boné', ok: false, detail: '—' },
+    { id: 'pose', label: 'Pose de frente', ok: false, detail: '—' },
+];
+
 let stream = null;
 let detectInterval = null;
 let isDetecting = false;
@@ -125,6 +130,7 @@ let captures = [];
 let lastCaptureAt = 0;
 let lastAnalysis = null;
 let readyStreak = 0;
+let scanPulse = 0;
 
 function setStatus(text, type) {
     const el = document.getElementById('cameraStatus');
@@ -132,17 +138,39 @@ function setStatus(text, type) {
     el.className = 'status-bar' + (type ? ' ' + type : '');
 }
 
-function renderAttrChips(fa) {
-    const box = document.getElementById('attrChips');
-    if (!fa) { box.innerHTML = ''; return; }
-    const chips = [];
-    if (fa.sunglasses) chips.push(['Oculos escuros — remova', 'warn']);
-    else chips.push(fa.eyes_open ? ['Olhos abertos', 'ok'] : ['Abra os olhos', 'warn']);
-    if (fa.hat) chips.push(['Chapeu/bone — remova', 'warn']);
-    if (fa.capture_ready) chips.push(['Pronto', 'ok']);
-    box.innerHTML = chips.map(([label, cls]) =>
-        '<span class="attr-chip ' + cls + '">' + label + '</span>'
-    ).join('');
+function renderScanChecklist(fa) {
+    const panel = document.getElementById('scanPanel');
+    const list = document.getElementById('scanChecklist');
+    const bar = document.getElementById('scanProgressBar');
+    const label = document.getElementById('scanProgressLabel');
+    panel.hidden = false;
+
+    const checks = (fa && Array.isArray(fa.checks) && fa.checks.length)
+        ? fa.checks
+        : DEFAULT_CHECKS.map((c) => Object.assign({}, c));
+
+    const progress = fa && typeof fa.scan_progress === 'number'
+        ? fa.scan_progress
+        : (checks.filter((c) => c.ok).length / checks.length);
+
+    const pct = Math.round(progress * 100);
+    bar.style.width = pct + '%';
+    label.textContent = pct + '%';
+
+    list.innerHTML = checks.map((c) => {
+        const cls = c.ok ? 'ok' : 'pending';
+        const mark = c.ok ? '✓' : '·';
+        const detail = c.ok ? '' : (' <span class="scan-detail">' + (c.detail || '') + '</span>');
+        return '<li class="scan-item ' + cls + '"><span class="scan-mark">' + mark + '</span><span class="scan-label">' + c.label + '</span>' + detail + '</li>';
+    }).join('');
+}
+
+function firstPendingDetail(fa) {
+    if (!fa || !Array.isArray(fa.checks)) return 'Centralize o rosto';
+    const pending = fa.checks.find((c) => !c.ok);
+    if (!pending) return 'Pronto para capturar';
+    if (pending.detail && pending.detail !== '—' && pending.detail !== 'OK') return pending.detail;
+    return pending.label;
 }
 
 function updateCaptureUI() {
@@ -177,7 +205,36 @@ function stopCamera() {
     document.getElementById('startWebcamBtn').style.display = 'inline-flex';
     document.getElementById('stopWebcamBtn').style.display = 'none';
     document.getElementById('captureBtn').style.display = 'none';
+    document.getElementById('scanPanel').hidden = true;
     readyStreak = 0;
+}
+
+function drawLandmarks(ctx, landmarks, ready) {
+    if (!landmarks) return;
+    const keys = ['left_eye', 'right_eye', 'nose', 'mouth', 'left_mouth', 'right_mouth'];
+    const color = ready ? '#3dd68c' : '#1f6b5c';
+    const pulse = 3 + Math.sin(scanPulse) * 1.2;
+    keys.forEach((key) => {
+        const pt = landmarks[key];
+        if (!pt || pt.length < 2) return;
+        ctx.beginPath();
+        ctx.arc(pt[0], pt[1], pulse, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(pt[0], pt[1], pulse + 4, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(31,107,92,0.35)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+    });
+    if (landmarks.left_eye && landmarks.right_eye) {
+        ctx.beginPath();
+        ctx.moveTo(landmarks.left_eye[0], landmarks.left_eye[1]);
+        ctx.lineTo(landmarks.right_eye[0], landmarks.right_eye[1]);
+        ctx.strokeStyle = ready ? 'rgba(61,214,140,0.55)' : 'rgba(31,107,92,0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+    }
 }
 
 document.getElementById('startWebcamBtn').addEventListener('click', async () => {
@@ -197,8 +254,9 @@ document.getElementById('startWebcamBtn').addEventListener('click', async () => 
         document.getElementById('startWebcamBtn').style.display = 'none';
         document.getElementById('stopWebcamBtn').style.display = 'inline-flex';
         document.getElementById('captureBtn').style.display = 'inline-flex';
-        setStatus('Capture ' + REQUIRED_CAPTURES + ' fotos.');
-        detectInterval = setInterval(detectAndGuideFace, 500);
+        renderScanChecklist(null);
+        setStatus('Escaneando rosto. Aguarde todos os itens ficarem verdes.');
+        detectInterval = setInterval(detectAndGuideFace, 450);
     } catch (error) {
         setStatus('Erro camera: ' + (error.message || error.name), 'error');
     }
@@ -206,7 +264,6 @@ document.getElementById('startWebcamBtn').addEventListener('click', async () => 
 
 document.getElementById('stopWebcamBtn').addEventListener('click', () => {
     stopCamera();
-    renderAttrChips(null);
     setStatus('Camera desligada.');
 });
 
@@ -226,6 +283,7 @@ async function detectAndGuideFace() {
     if (!video.srcObject || video.readyState < 2 || video.videoWidth === 0) return;
 
     isDetecting = true;
+    scanPulse += 0.35;
     try {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -245,31 +303,27 @@ async function detectAndGuideFace() {
             const [x, y, w, h] = face.location;
             const fa = face.facial_analysis || {};
             lastAnalysis = fa;
-            renderAttrChips(fa);
+            renderScanChecklist(fa);
             overlayCanvas.style.display = 'block';
-            const ready = !!fa.capture_ready && !fa.sunglasses && !fa.hat;
+            const ready = !!fa.capture_ready;
             ctx.strokeStyle = ready ? '#3dd68c' : '#f5a524';
             ctx.lineWidth = 2;
             ctx.strokeRect(x, y, w, h);
+            drawLandmarks(ctx, face.landmarks, ready);
 
-            if (fa.sunglasses) {
-                faceGuide.classList.remove('ready'); readyStreak = 0;
-                guideText.textContent = 'Remova os oculos escuros';
-            } else if (fa.hat) {
-                faceGuide.classList.remove('ready'); readyStreak = 0;
-                guideText.textContent = 'Remova chapeu/bone';
-            } else if (!fa.eyes_open) {
-                faceGuide.classList.remove('ready'); readyStreak = 0;
-                guideText.textContent = 'Abra os olhos';
-            } else if (!ready) {
-                faceGuide.classList.remove('ready'); readyStreak = 0;
-                guideText.textContent = (fa.capture_blockers && fa.capture_blockers[0]) || 'Ajuste a pose';
+            if (!ready) {
+                faceGuide.classList.remove('ready');
+                readyStreak = 0;
+                const tip = firstPendingDetail(fa);
+                guideText.textContent = tip;
+                setStatus('Ajuste: ' + tip, 'error');
             } else {
                 faceGuide.classList.add('ready');
                 readyStreak += 1;
-                guideText.textContent = 'Foto ' + (captures.length + 1) + '/' + REQUIRED_CAPTURES;
+                guideText.textContent = 'Scan OK — foto ' + (captures.length + 1) + '/' + REQUIRED_CAPTURES;
+                setStatus('Mantendo pose... ' + readyStreak + '/' + READY_STREAK_NEEDED, 'success');
                 const now = Date.now();
-                if (readyStreak >= 2 && now - lastCaptureAt > 1700) {
+                if (readyStreak >= READY_STREAK_NEEDED && now - lastCaptureAt > 1600) {
                     lastCaptureAt = now;
                     takeCapture();
                 }
@@ -279,8 +333,9 @@ async function detectAndGuideFace() {
             faceGuide.classList.remove('ready');
             readyStreak = 0;
             lastAnalysis = null;
-            renderAttrChips(null);
+            renderScanChecklist(null);
             guideText.textContent = 'Nenhum rosto detectado';
+            setStatus('Posicione o rosto na frente da camera.', 'error');
         }
     } catch (e) {
         console.error(e);
@@ -291,8 +346,8 @@ async function detectAndGuideFace() {
 
 function takeCapture() {
     if (captures.length >= REQUIRED_CAPTURES) return;
-    if (lastAnalysis && (lastAnalysis.sunglasses || lastAnalysis.hat || !lastAnalysis.capture_ready)) {
-        setStatus('Ainda nao esta pronto para capturar.', 'error');
+    if (!lastAnalysis || !lastAnalysis.capture_ready) {
+        setStatus('Captura bloqueada: ' + firstPendingDetail(lastAnalysis) + '.', 'error');
         return;
     }
     const video = document.getElementById('video');
@@ -307,10 +362,16 @@ function takeCapture() {
         document.getElementById('guideText').textContent = 'Pronto!';
         stopCamera();
         setStatus(REQUIRED_CAPTURES + ' fotos capturadas. Salve o novo rosto.', 'success');
+    } else {
+        setStatus('Captura ' + captures.length + '/' + REQUIRED_CAPTURES + '. Continue o scan.', 'success');
     }
 }
 
 document.getElementById('captureBtn').addEventListener('click', () => {
+    if (!lastAnalysis || !lastAnalysis.capture_ready) {
+        setStatus('Ainda nao esta pronto: ' + firstPendingDetail(lastAnalysis) + '.', 'error');
+        return;
+    }
     lastCaptureAt = Date.now();
     takeCapture();
 });

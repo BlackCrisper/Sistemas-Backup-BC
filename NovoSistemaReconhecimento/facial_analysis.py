@@ -111,7 +111,8 @@ class FacialAnalysis:
     def detect_sunglasses(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int],
                           landmarks: Optional[Dict] = None) -> Tuple[bool, float]:
         """
-        Detecta óculos escuros (lentes opacas). Óculos transparentes não bloqueiam.
+        Detecta óculos escuros (lentes opacas). Conservador para evitar falso positivo
+        com sombra, sobrancelha ou íris escura. Óculos transparentes não bloqueiam.
         """
         x, y, w, h = face_bbox
         if w <= 0 or h <= 0:
@@ -125,45 +126,68 @@ class FacialAnalysis:
         patches = []
         if landmarks and 'left_eye' in landmarks and 'right_eye' in landmarks:
             for key in ('left_eye', 'right_eye'):
-                patch = self._eye_patch_from_landmark(gray, landmarks[key], w, h)
+                # Patch um pouco menor: foca na lente, não na sobrancelha
+                patch = self._eye_patch_from_landmark(
+                    gray, landmarks[key], max(1, int(w * 0.85)), max(1, int(h * 0.75))
+                )
                 if patch is not None and patch.size > 0:
                     patches.append(patch)
 
         if len(patches) < 2:
-            eye_band = gray[y + int(h * 0.18):y + int(h * 0.48), x + int(w * 0.12):x + int(w * 0.88)]
+            eye_band = gray[y + int(h * 0.22):y + int(h * 0.42), x + int(w * 0.15):x + int(w * 0.85)]
             if eye_band.size == 0:
                 return False, 0.0
             mid = eye_band.shape[1] // 2
             patches = [eye_band[:, :mid], eye_band[:, mid:]]
 
         cheek = gray[y + int(h * 0.55):y + int(h * 0.75), x + int(w * 0.25):x + int(w * 0.75)]
+        forehead = gray[y + int(h * 0.08):y + int(h * 0.22), x + int(w * 0.25):x + int(w * 0.75)]
         cheek_mean = float(np.mean(cheek)) if cheek.size else 120.0
+        forehead_mean = float(np.mean(forehead)) if forehead.size else cheek_mean
+        skin_ref = max(cheek_mean, forehead_mean)
 
-        dark_scores = []
-        texture_scores = []
-        for patch in patches:
+        per_eye = []
+        for patch in patches[:2]:
             if patch.size == 0:
                 continue
             mean_v = float(np.mean(patch))
             std_v = float(np.std(patch))
-            dark_ratio = float(np.mean(patch < 55))
-            dark_scores.append(0.0)
-            if mean_v < cheek_mean - 35:
-                dark_scores[-1] += 0.35
-            if mean_v < 70:
-                dark_scores[-1] += 0.35
-            if dark_ratio > 0.45:
-                dark_scores[-1] += 0.30
-            texture_scores.append(1.0 if std_v < 22 else 0.0)
+            dark_ratio = float(np.mean(patch < 40))
+            # Íris/pupila visível → textura; lente opaca → escuro e homogêneo
+            opaque = (
+                mean_v < skin_ref - 55
+                and mean_v < 48
+                and dark_ratio > 0.55
+                and std_v < 16
+            )
+            per_eye.append({
+                'opaque': opaque,
+                'mean': mean_v,
+                'std': std_v,
+                'dark_ratio': dark_ratio,
+            })
 
-        if not dark_scores:
+        if len(per_eye) < 2:
             return False, 0.0
 
-        score = float(np.mean(dark_scores))
-        if np.mean(texture_scores) >= 0.5:
-            score += 0.15
+        # Ambos os olhos precisam parecer lente opaca (evita sombra só de um lado)
+        if not (per_eye[0]['opaque'] and per_eye[1]['opaque']):
+            return False, 0.0
 
-        has_sunglasses = score >= 0.55
+        # Se ainda há bastante textura média, provavelmente são olhos reais
+        if float(np.mean([e['std'] for e in per_eye])) >= 18:
+            return False, 0.0
+
+        score = 0.55
+        mean_gap = skin_ref - float(np.mean([e['mean'] for e in per_eye]))
+        if mean_gap > 65:
+            score += 0.2
+        if float(np.mean([e['dark_ratio'] for e in per_eye])) > 0.7:
+            score += 0.15
+        if float(np.mean([e['std'] for e in per_eye])) < 12:
+            score += 0.1
+
+        has_sunglasses = score >= 0.75
         return has_sunglasses, float(min(1.0, score))
     
     def detect_eye_state(self, eye_region: np.ndarray) -> Tuple[str, float]:
@@ -236,60 +260,94 @@ class FacialAnalysis:
     
     def detect_hat(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Tuple[bool, float]:
         """
-        Heurística para chapéu/boné: região acima da testa com textura/cor diferente da pele.
+        Detecta chapéu/boné de forma conservadora.
+        Cabelo escuro acima da testa NÃO deve contar como chapéu.
+        Exige evidência de aba/cobertura opaca sobre a testa.
         """
         x, y, w, h = face_bbox
         img_h, img_w = face_image.shape[:2]
 
-        # Faixa acima do rosto (onde ficaria o chapéu)
-        band_h = max(12, int(h * 0.35))
-        y1 = max(0, y - band_h)
-        y2 = max(0, y + int(h * 0.12))
-        x1 = max(0, x + int(w * 0.1))
-        x2 = min(img_w, x + int(w * 0.9))
+        # Faixa logo acima do topo do bbox (possível aba)
+        brim_h = max(10, int(h * 0.22))
+        y1 = max(0, y - brim_h)
+        y2 = max(0, min(img_h, y + int(h * 0.06)))
+        x1 = max(0, x + int(w * 0.12))
+        x2 = min(img_w, x + int(w * 0.88))
 
-        if y2 <= y1 or x2 <= x1:
+        # Testa (deve ser pele se não houver boné baixo)
+        fh_y1 = y + int(h * 0.08)
+        fh_y2 = y + int(h * 0.28)
+        fh_x1 = x + int(w * 0.25)
+        fh_x2 = x + int(w * 0.75)
+
+        face_mid = face_image[
+            y + int(h * 0.35):y + int(h * 0.55),
+            x + int(w * 0.25):x + int(w * 0.75)
+        ]
+        if y2 <= y1 or x2 <= x1 or face_mid.size == 0:
+            return False, 0.0
+        if fh_y2 <= fh_y1 or fh_x2 <= fh_x1:
             return False, 0.0
 
         top = face_image[y1:y2, x1:x2]
-        face_mid = face_image[y + int(h * 0.25):y + int(h * 0.55), x + int(w * 0.25):x + int(w * 0.75)]
-        if top.size == 0 or face_mid.size == 0:
+        forehead = face_image[fh_y1:fh_y2, fh_x1:fh_x2]
+        if top.size == 0 or forehead.size == 0:
             return False, 0.0
 
         if len(top.shape) == 3:
             top_gray = cv2.cvtColor(top, cv2.COLOR_BGR2GRAY)
             mid_gray = cv2.cvtColor(face_mid, cv2.COLOR_BGR2GRAY)
+            fh_gray = cv2.cvtColor(forehead, cv2.COLOR_BGR2GRAY)
             top_hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV)
             mid_hsv = cv2.cvtColor(face_mid, cv2.COLOR_BGR2HSV)
+            fh_hsv = cv2.cvtColor(forehead, cv2.COLOR_BGR2HSV)
         else:
             top_gray = top
             mid_gray = face_mid
-            top_hsv = None
-            mid_hsv = None
+            fh_gray = forehead
+            top_hsv = mid_hsv = fh_hsv = None
 
-        # Diferença de brilho e saturação (chapéu costuma ser mais escuro/saturado que a pele)
-        brightness_gap = float(np.mean(mid_gray) - np.mean(top_gray))
-        texture_top = float(np.std(top_gray))
-        texture_mid = float(np.std(mid_gray))
+        top_mean = float(np.mean(top_gray))
+        mid_mean = float(np.mean(mid_gray))
+        fh_mean = float(np.mean(fh_gray))
+        brightness_gap = mid_mean - top_mean
+        forehead_gap = mid_mean - fh_mean
+
+        # Aba/boné tende a ser mais uniforme que cabelo
+        top_std = float(np.std(top_gray))
+        fh_std = float(np.std(fh_gray))
+
+        # Borda horizontal forte na linha da testa (aba do boné)
+        edge_band = top_gray[-max(3, top_gray.shape[0] // 3):, :]
+        edges = cv2.Canny(edge_band, 60, 140)
+        horizontal_edge = float(np.mean(edges > 0))
 
         sat_gap = 0.0
         if top_hsv is not None and mid_hsv is not None:
             sat_gap = float(np.mean(top_hsv[:, :, 1]) - np.mean(mid_hsv[:, :, 1]))
 
-        # Rosto muito baixo no frame (espaço grande acima) também sugere chapéu/boné
-        top_margin_ratio = y / max(img_h, 1)
+        # Testa coberta: muito mais escura que a face e com pouca variação de pele
+        forehead_covered = forehead_gap > 40 and fh_mean < 70 and fh_std < 22
+        strong_brim = (
+            brightness_gap > 45
+            and top_mean < 60
+            and top_std < 28
+            and horizontal_edge > 0.12
+        )
 
         score = 0.0
-        if brightness_gap > 32:
-            score += 0.35
-        if sat_gap > 25:
-            score += 0.25
-        if texture_top > texture_mid * 1.25 and texture_top > 28:
-            score += 0.2
-        if top_margin_ratio > 0.28 and brightness_gap > 20:
-            score += 0.2
+        if strong_brim:
+            score += 0.45
+        if forehead_covered:
+            score += 0.40
+        if sat_gap > 40 and brightness_gap > 40:
+            score += 0.15
 
-        has_hat = score >= 0.55
+        # Cabelo sozinho (textura alta, sem cobertura da testa) → não é chapéu
+        if not forehead_covered and top_std > 32 and horizontal_edge < 0.08:
+            return False, float(min(0.4, score))
+
+        has_hat = score >= 0.75
         return has_hat, float(min(1.0, score))
 
     def _eye_patch_from_landmark(self, gray: np.ndarray, point: Tuple[float, float], face_w: int, face_h: int) -> Optional[np.ndarray]:
@@ -414,10 +472,43 @@ class FacialAnalysis:
             'eyes_detected': int(eyes_count),
         }
 
+    def validate_frontal_pose(self, landmarks: Optional[Dict]) -> Tuple[bool, str]:
+        """Verifica pose frontal aproximada via landmarks YuNet."""
+        if not landmarks:
+            return False, 'pose não confirmada'
+
+        required = ('left_eye', 'right_eye', 'nose')
+        if not all(k in landmarks for k in required):
+            return False, 'pose não confirmada'
+
+        lx, ly = landmarks['left_eye']
+        rx, ry = landmarks['right_eye']
+        nx, ny = landmarks['nose']
+
+        eye_dx = abs(float(lx) - float(rx))
+        if eye_dx < 1e-3:
+            return False, 'olhe para a câmera'
+
+        eye_dy_ratio = abs(float(ly) - float(ry)) / eye_dx
+        if eye_dy_ratio > 0.22:
+            return False, 'mantenha a cabeça reta'
+
+        mid_x = (float(lx) + float(rx)) / 2.0
+        nose_offset = abs(float(nx) - mid_x) / eye_dx
+        if nose_offset > 0.28:
+            return False, 'vire o rosto de frente'
+
+        eye_y = (float(ly) + float(ry)) / 2.0
+        if float(ny) < eye_y:
+            return False, 'olhe para a câmera'
+
+        return True, 'OK'
+
     def analyze_full_face(self, face_image: np.ndarray, face_bbox: Tuple[int, int, int, int],
-                          landmarks: Optional[Dict] = None) -> Dict:
+                          landmarks: Optional[Dict] = None,
+                          frame_shape: Optional[Tuple[int, ...]] = None) -> Dict:
         """
-        Análise completa: olhos, óculos, chapéu e qualidade.
+        Análise completa com checklist de escaneamento para cadastro.
         """
         analysis = self.analyze_eyes(face_image, face_bbox, landmarks=landmarks)
         has_hat, hat_confidence = self.detect_hat(face_image, face_bbox)
@@ -425,7 +516,17 @@ class FacialAnalysis:
         x, y, w, h = face_bbox
         face_region = face_image[y:y + h, x:x + w]
 
-        if face_region.size == 0:
+        def empty_result(blockers):
+            checks = [
+                {'id': 'face', 'label': 'Rosto detectado', 'ok': False, 'detail': 'rosto inválido'},
+                {'id': 'lighting', 'label': 'Iluminação', 'ok': False, 'detail': '—'},
+                {'id': 'sharpness', 'label': 'Nitidez', 'ok': False, 'detail': '—'},
+                {'id': 'eyes', 'label': 'Olhos abertos', 'ok': False, 'detail': '—'},
+                {'id': 'sunglasses', 'label': 'Sem óculos escuros', 'ok': False, 'detail': '—'},
+                {'id': 'hat', 'label': 'Sem chapéu/boné', 'ok': False, 'detail': '—'},
+                {'id': 'pose', 'label': 'Pose de frente', 'ok': False, 'detail': '—'},
+                {'id': 'position', 'label': 'Posição na câmera', 'ok': False, 'detail': '—'},
+            ]
             analysis.update({
                 'hat': False,
                 'hat_confidence': 0.0,
@@ -435,10 +536,17 @@ class FacialAnalysis:
                 'brightness': 0.0,
                 'sharpness': 0.0,
                 'quality': 'poor',
+                'pose_ok': False,
+                'position_ok': False,
+                'checks': checks,
+                'scan_progress': 0.0,
                 'capture_ready': False,
-                'capture_blockers': ['rosto inválido'],
+                'capture_blockers': blockers,
             })
             return analysis
+
+        if face_region.size == 0:
+            return empty_result(['rosto inválido'])
 
         if len(face_region.shape) == 3:
             gray_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
@@ -451,6 +559,33 @@ class FacialAnalysis:
         sharpness = float(np.mean(np.sqrt(grad_x ** 2 + grad_y ** 2)))
 
         has_sunglasses = bool(analysis.get('sunglasses', False))
+        eyes_open = bool(analysis.get('eyes_open', False))
+        lighting_ok = 45.0 <= mean_brightness <= 210.0
+        sharpness_ok = sharpness >= 18.0
+        pose_ok, pose_detail = self.validate_frontal_pose(landmarks)
+
+        # Posição relativa ao frame (quando dimensões disponíveis)
+        position_ok = True
+        position_detail = 'OK'
+        if frame_shape is not None and len(frame_shape) >= 2:
+            frame_h, frame_w = int(frame_shape[0]), int(frame_shape[1])
+            if frame_h > 0 and frame_w > 0:
+                cx = x + w / 2.0
+                cy = y + h / 2.0
+                offset_x = abs(cx - frame_w / 2.0) / frame_w
+                offset_y = abs(cy - frame_h / 2.0) / frame_h
+                height_ratio = h / float(frame_h)
+                if offset_x > 0.18 or offset_y > 0.18:
+                    position_ok = False
+                    position_detail = 'centralize o rosto'
+                elif height_ratio < 0.22:
+                    position_ok = False
+                    position_detail = 'aproxime-se'
+                elif height_ratio > 0.62:
+                    position_ok = False
+                    position_detail = 'afaste-se um pouco'
+                else:
+                    position_detail = 'OK'
 
         accessories = []
         if has_sunglasses:
@@ -460,22 +595,68 @@ class FacialAnalysis:
         if has_hat:
             accessories.append('chapéu/boné')
 
-        blockers = []
-        if has_sunglasses:
-            blockers.append('óculos escuros')
-        if has_hat:
-            blockers.append('remova chapéu/boné')
-        if not analysis.get('eyes_open') and not has_sunglasses:
-            if analysis.get('left_eye') == 'closed' or analysis.get('right_eye') == 'closed':
-                blockers.append('abra os olhos')
-            else:
-                blockers.append('olhos não confirmados')
-        if mean_brightness < 40:
-            blockers.append('pouca luz')
-        if mean_brightness > 220:
-            blockers.append('muita luz')
-        if sharpness < 18:
-            blockers.append('imagem borrada')
+        if not lighting_ok:
+            lighting_detail = 'pouca luz' if mean_brightness < 45 else 'muita luz'
+        else:
+            lighting_detail = 'OK'
+
+        if eyes_open:
+            eyes_detail = 'OK'
+        elif analysis.get('left_eye') == 'closed' or analysis.get('right_eye') == 'closed':
+            eyes_detail = 'abra os olhos'
+        else:
+            eyes_detail = 'olhos não confirmados'
+
+        checks = [
+            {'id': 'face', 'label': 'Rosto detectado', 'ok': True, 'detail': 'OK'},
+            {
+                'id': 'position',
+                'label': 'Posição na câmera',
+                'ok': bool(position_ok),
+                'detail': position_detail,
+            },
+            {
+                'id': 'lighting',
+                'label': 'Iluminação',
+                'ok': bool(lighting_ok),
+                'detail': lighting_detail,
+            },
+            {
+                'id': 'sharpness',
+                'label': 'Nitidez',
+                'ok': bool(sharpness_ok),
+                'detail': 'OK' if sharpness_ok else 'imagem borrada',
+            },
+            {
+                'id': 'eyes',
+                'label': 'Olhos abertos',
+                'ok': bool(eyes_open) and not has_sunglasses,
+                'detail': 'óculos escuros' if has_sunglasses else eyes_detail,
+            },
+            {
+                'id': 'sunglasses',
+                'label': 'Sem óculos escuros',
+                'ok': not has_sunglasses,
+                'detail': 'remova os óculos escuros' if has_sunglasses else 'OK',
+            },
+            {
+                'id': 'hat',
+                'label': 'Sem chapéu/boné',
+                'ok': not bool(has_hat),
+                'detail': 'remova chapéu/boné' if has_hat else 'OK',
+            },
+            {
+                'id': 'pose',
+                'label': 'Pose de frente',
+                'ok': bool(pose_ok),
+                'detail': pose_detail if not pose_ok else 'OK',
+            },
+        ]
+
+        blockers = [c['detail'] for c in checks if not c['ok'] and c['id'] != 'face']
+        ok_count = sum(1 for c in checks if c['ok'])
+        scan_progress = float(ok_count) / float(len(checks)) if checks else 0.0
+        capture_ready = all(c['ok'] for c in checks)
 
         analysis.update({
             'hat': bool(has_hat),
@@ -486,8 +667,12 @@ class FacialAnalysis:
             'brightness': mean_brightness,
             'brightness_std': float(np.std(gray_face)),
             'sharpness': sharpness,
-            'quality': 'good' if sharpness > 30 and 50 < mean_brightness < 200 else 'poor',
-            'capture_ready': len(blockers) == 0 and analysis.get('eyes_open', False),
+            'quality': 'good' if sharpness_ok and lighting_ok else 'poor',
+            'pose_ok': bool(pose_ok),
+            'position_ok': bool(position_ok),
+            'checks': checks,
+            'scan_progress': scan_progress,
+            'capture_ready': capture_ready,
             'capture_blockers': blockers,
         })
 

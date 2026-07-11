@@ -87,6 +87,59 @@ class FaceRecognizer:
             self.detector.setInputSize(size)
             self._input_size = size
 
+    @staticmethod
+    def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        x1, y1 = max(ax, bx), max(ay, by)
+        x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        if inter <= 0:
+            return 0.0
+        union = aw * ah + bw * bh - inter
+        return float(inter) / float(union) if union > 0 else 0.0
+
+    def _nms_face_results(self, results: List[Dict], iou_threshold: float = 0.35) -> List[Dict]:
+        """Remove detecções duplicadas do mesmo rosto (YuNet às vezes devolve caixas sobrepostas)."""
+        if len(results) <= 1:
+            return results
+        ordered = sorted(results, key=lambda f: float(f.get('score', 0.0)), reverse=True)
+        kept: List[Dict] = []
+        for face in ordered:
+            loc = face['location']
+            if any(self._bbox_iou(loc, k['location']) >= iou_threshold for k in kept):
+                continue
+            kept.append(face)
+        return kept
+
+    def select_primary_face(self, faces: List[Dict]) -> Tuple[Optional[Dict], bool]:
+        """
+        Escolhe o rosto principal.
+        Retorna (face, has_multiple_distinct).
+        has_multiple_distinct=True só se houver outro rosto grande/confiante sem sobreposição.
+        """
+        faces = self._nms_face_results(faces)
+        if not faces:
+            return None, False
+        primary = max(faces, key=lambda f: float(f.get('score', 0.0)))
+        if len(faces) == 1:
+            return primary, False
+
+        px, py, pw, ph = primary['location']
+        primary_area = max(1, pw * ph)
+        for other in faces:
+            if other is primary:
+                continue
+            if self._bbox_iou(primary['location'], other['location']) >= 0.25:
+                continue
+            ox, oy, ow, oh = other['location']
+            other_area = max(1, ow * oh)
+            other_score = float(other.get('score', 0.0))
+            # Segundo rosto real: tamanho relevante + confiança alta
+            if other_area >= 0.45 * primary_area and other_score >= 0.65:
+                return primary, True
+        return primary, False
+
     def detect_faces_detailed(self, image: np.ndarray) -> List[Dict]:
         """
         Detecta rostos com YuNet.
@@ -131,7 +184,7 @@ class FaceRecognizer:
                 })
 
         if results:
-            return results
+            return self._nms_face_results(results)
 
         # Fallback Haar
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
@@ -143,7 +196,7 @@ class FaceRecognizer:
                 'score': 0.5,
                 'face_row': None,
             })
-        return results
+        return self._nms_face_results(results)
 
     def detect_faces(self, image: np.ndarray) -> List[Tuple[int, int, int, int]]:
         return [r['location'] for r in self.detect_faces_detailed(image)]
@@ -449,11 +502,16 @@ class FaceRecognizer:
         if not faces:
             return False, 'Nenhum rosto detectado'
 
-        face = max(faces, key=lambda f: f['score'])
+        face, has_multiple = self.select_primary_face(faces)
+        if has_multiple:
+            return False, 'Múltiplos rostos detectados. Cadastre uma pessoa por vez.'
+        if face is None:
+            return False, 'Nenhum rosto detectado'
+
         if face_bbox is not None:
-            # Prefere o bbox informado se houver match
+            # Prefere o bbox informado se houver match aproximado
             for f in faces:
-                if f['location'] == face_bbox:
+                if f['location'] == face_bbox or self._bbox_iou(f['location'], face_bbox) >= 0.5:
                     face = f
                     break
 

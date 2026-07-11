@@ -1256,6 +1256,106 @@ body.modal-open {
     }
 }
 
+/* Scan checklist no cadastro */
+.scan-panel {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+}
+
+.scan-progress-wrap {
+    margin-bottom: 10px;
+}
+
+.scan-progress-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+.scan-progress-meta strong {
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+}
+
+.scan-progress {
+    height: 6px;
+    border-radius: 999px;
+    background: var(--bg-accent);
+    overflow: hidden;
+}
+
+.scan-progress-bar {
+    height: 100%;
+    width: 0%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--accent), #3a9b86);
+    transition: width 0.35s ease;
+}
+
+.scan-checklist {
+    list-style: none;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+}
+
+.scan-item {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 8px 10px;
+    border-radius: 10px;
+    background: var(--bg);
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    min-height: 36px;
+}
+
+.scan-item.ok {
+    background: var(--success-soft);
+    color: var(--success);
+}
+
+.scan-item.pending {
+    background: var(--bg-accent);
+}
+
+.scan-mark {
+    font-weight: 700;
+    width: 12px;
+    flex-shrink: 0;
+}
+
+.scan-label {
+    font-weight: 600;
+    color: inherit;
+}
+
+.scan-detail {
+    font-weight: 500;
+    opacity: 0.85;
+    font-size: 0.72rem;
+}
+
+@media (max-width: 768px) {
+    .scan-checklist {
+        grid-template-columns: 1fr;
+    }
+
+    .scan-item {
+        font-size: 0.8rem;
+    }
+}
+
 @media (max-width: 768px) {
     .sim-confirm {
         padding: 0 4px;

@@ -6,7 +6,7 @@
 {% block content %}
 <div class="page-header page-header-compact">
     <h2>Novo usuário</h2>
-    <p>3 fotos de frente, olhos abertos, sem óculos escuros nem boné.</p>
+    <p>Escaneie o rosto: luz, olhos, pose e acessórios antes das 3 fotos.</p>
 </div>
 
 <div class="panel panel-wide">
@@ -34,7 +34,19 @@
                 </div>
             </div>
 
-            <div id="attrChips" class="attr-chips" aria-live="polite"></div>
+            <div id="scanPanel" class="scan-panel" hidden>
+                <div class="scan-progress-wrap">
+                    <div class="scan-progress-meta">
+                        <span>Escaneamento</span>
+                        <strong id="scanProgressLabel">0%</strong>
+                    </div>
+                    <div class="scan-progress">
+                        <div id="scanProgressBar" class="scan-progress-bar"></div>
+                    </div>
+                </div>
+                <ul id="scanChecklist" class="scan-checklist" aria-live="polite"></ul>
+            </div>
+
             <div id="thumbs" class="thumbs" style="display:none;"></div>
 
             <div class="capture-controls">
@@ -76,27 +88,21 @@
     border-radius: 8px;
     border: 1px solid var(--border);
 }
-.attr-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-top: 10px;
-    min-height: 28px;
-}
-.attr-chip {
-    font-size: 0.75rem;
-    font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 999px;
-    background: var(--bg-accent);
-    color: var(--text-muted);
-}
-.attr-chip.ok { background: var(--success-soft); color: var(--success); }
-.attr-chip.warn { background: var(--warning-soft); color: var(--warning); }
-.attr-chip.info { background: var(--accent-soft); color: var(--accent); }
 </style>
 <script>
 const REQUIRED_CAPTURES = 3;
+const READY_STREAK_NEEDED = 3;
+const DEFAULT_CHECKS = [
+    { id: 'face', label: 'Rosto detectado', ok: false, detail: 'procure o rosto' },
+    { id: 'position', label: 'Posição na câmera', ok: false, detail: '—' },
+    { id: 'lighting', label: 'Iluminação', ok: false, detail: '—' },
+    { id: 'sharpness', label: 'Nitidez', ok: false, detail: '—' },
+    { id: 'eyes', label: 'Olhos abertos', ok: false, detail: '—' },
+    { id: 'sunglasses', label: 'Sem óculos escuros', ok: false, detail: '—' },
+    { id: 'hat', label: 'Sem chapéu/boné', ok: false, detail: '—' },
+    { id: 'pose', label: 'Pose de frente', ok: false, detail: '—' },
+];
+
 let stream = null;
 let detectInterval = null;
 let isDetecting = false;
@@ -104,6 +110,7 @@ let captures = [];
 let lastCaptureAt = 0;
 let lastAnalysis = null;
 let readyStreak = 0;
+let scanPulse = 0;
 
 function setStatus(text, type = '') {
     const el = document.getElementById('cameraStatus');
@@ -111,21 +118,39 @@ function setStatus(text, type = '') {
     el.className = 'status-bar' + (type ? ' ' + type : '');
 }
 
-function renderAttrChips(fa) {
-    const box = document.getElementById('attrChips');
-    if (!fa) { box.innerHTML = ''; return; }
-    const chips = [];
-    if (fa.sunglasses) {
-        chips.push(['Oculos escuros — remova', 'warn']);
-    } else {
-        chips.push(fa.eyes_open ? ['Olhos abertos', 'ok'] : ['Abra os olhos', 'warn']);
-        if (fa.glasses) chips.push(['Oculos', 'info']);
-    }
-    if (fa.hat) chips.push(['Chapeu/bone — remova', 'warn']);
-    if (fa.capture_ready) chips.push(['Pronto', 'ok']);
-    box.innerHTML = chips.map(([label, cls]) =>
-        '<span class="attr-chip ' + cls + '">' + label + '</span>'
-    ).join('');
+function renderScanChecklist(fa) {
+    const panel = document.getElementById('scanPanel');
+    const list = document.getElementById('scanChecklist');
+    const bar = document.getElementById('scanProgressBar');
+    const label = document.getElementById('scanProgressLabel');
+    panel.hidden = false;
+
+    const checks = (fa && Array.isArray(fa.checks) && fa.checks.length)
+        ? fa.checks
+        : DEFAULT_CHECKS.map((c) => Object.assign({}, c));
+
+    const progress = fa && typeof fa.scan_progress === 'number'
+        ? fa.scan_progress
+        : (checks.filter((c) => c.ok).length / checks.length);
+
+    const pct = Math.round(progress * 100);
+    bar.style.width = pct + '%';
+    label.textContent = pct + '%';
+
+    list.innerHTML = checks.map((c) => {
+        const cls = c.ok ? 'ok' : 'pending';
+        const mark = c.ok ? '✓' : '·';
+        const detail = c.ok ? '' : (' <span class="scan-detail">' + (c.detail || '') + '</span>');
+        return '<li class="scan-item ' + cls + '"><span class="scan-mark">' + mark + '</span><span class="scan-label">' + c.label + '</span>' + detail + '</li>';
+    }).join('');
+}
+
+function firstPendingDetail(fa) {
+    if (!fa || !Array.isArray(fa.checks)) return 'Centralize o rosto';
+    const pending = fa.checks.find((c) => !c.ok);
+    if (!pending) return 'Pronto para capturar';
+    if (pending.detail && pending.detail !== '—' && pending.detail !== 'OK') return pending.detail;
+    return pending.label;
 }
 
 function updateCaptureUI() {
@@ -195,7 +220,37 @@ function stopCamera() {
     document.getElementById('startWebcamBtn').style.display = 'inline-flex';
     document.getElementById('stopWebcamBtn').style.display = 'none';
     document.getElementById('captureBtn').style.display = 'none';
+    document.getElementById('scanPanel').hidden = true;
     readyStreak = 0;
+}
+
+function drawLandmarks(ctx, landmarks, ready) {
+    if (!landmarks) return;
+    const keys = ['left_eye', 'right_eye', 'nose', 'mouth', 'left_mouth', 'right_mouth'];
+    const color = ready ? '#3dd68c' : '#1f6b5c';
+    const pulse = 3 + Math.sin(scanPulse) * 1.2;
+    keys.forEach((key) => {
+        const pt = landmarks[key];
+        if (!pt || pt.length < 2) return;
+        ctx.beginPath();
+        ctx.arc(pt[0], pt[1], pulse, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(pt[0], pt[1], pulse + 4, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(31,107,92,0.35)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+    });
+    // Linha leve entre os olhos (sensação de scan)
+    if (landmarks.left_eye && landmarks.right_eye) {
+        ctx.beginPath();
+        ctx.moveTo(landmarks.left_eye[0], landmarks.left_eye[1]);
+        ctx.lineTo(landmarks.right_eye[0], landmarks.right_eye[1]);
+        ctx.strokeStyle = ready ? 'rgba(61,214,140,0.55)' : 'rgba(31,107,92,0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+    }
 }
 
 document.getElementById('startWebcamBtn').addEventListener('click', async () => {
@@ -208,8 +263,9 @@ document.getElementById('startWebcamBtn').addEventListener('click', async () => 
         document.getElementById('startWebcamBtn').style.display = 'none';
         document.getElementById('stopWebcamBtn').style.display = 'inline-flex';
         document.getElementById('captureBtn').style.display = 'inline-flex';
-        setStatus('Sem oculos escuros nem bone. Capture ' + REQUIRED_CAPTURES + ' fotos.');
-        detectInterval = setInterval(detectAndGuideFace, 500);
+        renderScanChecklist(null);
+        setStatus('Escaneando rosto. Aguarde todos os itens ficarem verdes.');
+        detectInterval = setInterval(detectAndGuideFace, 450);
     } catch (error) {
         console.error(error);
         setStatus(cameraErrorMessage(error), 'error');
@@ -218,7 +274,6 @@ document.getElementById('startWebcamBtn').addEventListener('click', async () => 
 
 document.getElementById('stopWebcamBtn').addEventListener('click', () => {
     stopCamera();
-    renderAttrChips(null);
     setStatus('Camera desligada.');
 });
 
@@ -238,6 +293,7 @@ async function detectAndGuideFace() {
     if (!video.srcObject || video.readyState < 2 || video.videoWidth === 0) return;
 
     isDetecting = true;
+    scanPulse += 0.35;
     try {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -259,57 +315,28 @@ async function detectAndGuideFace() {
             const x = loc[0], y = loc[1], w = loc[2], h = loc[3];
             const fa = face.facial_analysis || {};
             lastAnalysis = fa;
-            renderAttrChips(fa);
+            renderScanChecklist(fa);
 
             overlayCanvas.style.display = 'block';
-            const eyesOk = !!fa.eyes_open;
-            const blockedAccessory = !!(fa.sunglasses || fa.hat);
-            const ready = !!fa.capture_ready && !blockedAccessory;
-            ctx.strokeStyle = eyesOk && ready ? '#3dd68c' : '#f5a524';
+            const ready = !!fa.capture_ready;
+            ctx.strokeStyle = ready ? '#3dd68c' : '#f5a524';
             ctx.lineWidth = 2;
             ctx.strokeRect(x, y, w, h);
+            drawLandmarks(ctx, face.landmarks, ready);
 
-            const faceCenterX = x + w / 2;
-            const offsetX = Math.abs(faceCenterX - video.videoWidth / 2);
-            const offsetY = Math.abs((y + h / 2) - video.videoHeight / 2);
-            const maxOffset = Math.min(video.videoWidth, video.videoHeight) * 0.2;
-            const faceHeightRatio = h / video.videoHeight;
-            const sizeOK = faceHeightRatio >= 0.2 && faceHeightRatio <= 0.65;
-            const centered = offsetX < maxOffset && offsetY < maxOffset;
-
-            if (fa.sunglasses) {
+            if (!ready) {
                 faceGuide.classList.remove('ready');
                 readyStreak = 0;
-                guideText.textContent = 'Remova os oculos escuros';
-                setStatus('Cadastro bloqueado: oculos escuros detectados.', 'error');
-            } else if (fa.hat) {
-                faceGuide.classList.remove('ready');
-                readyStreak = 0;
-                guideText.textContent = 'Remova chapeu/bone';
-                setStatus('Cadastro bloqueado: chapeu/bone detectado.', 'error');
-            } else if (!eyesOk) {
-                faceGuide.classList.remove('ready');
-                readyStreak = 0;
-                guideText.textContent = 'Abra os olhos para capturar';
-                setStatus('Captura bloqueada ate os olhos estarem abertos.', 'error');
-            } else if (!centered || !sizeOK) {
-                faceGuide.classList.remove('ready');
-                readyStreak = 0;
-                if (!centered) {
-                    guideText.textContent = faceCenterX < video.videoWidth / 2 ? 'Mova para a direita' : 'Mova para a esquerda';
-                } else {
-                    guideText.textContent = faceHeightRatio < 0.2 ? 'Aproxime-se' : 'Afaste-se um pouco';
-                }
-            } else if (!ready) {
-                faceGuide.classList.remove('ready');
-                readyStreak = 0;
-                guideText.textContent = (fa.capture_blockers && fa.capture_blockers[0]) || 'Ajuste a pose';
+                const tip = firstPendingDetail(fa);
+                guideText.textContent = tip;
+                setStatus('Ajuste: ' + tip, 'error');
             } else {
                 faceGuide.classList.add('ready');
                 readyStreak += 1;
-                guideText.textContent = 'Olhos ok — foto ' + (captures.length + 1) + '/' + REQUIRED_CAPTURES;
+                guideText.textContent = 'Scan OK — foto ' + (captures.length + 1) + '/' + REQUIRED_CAPTURES;
+                setStatus('Mantendo pose... ' + readyStreak + '/' + READY_STREAK_NEEDED, 'success');
                 const now = Date.now();
-                if (readyStreak >= 2 && now - lastCaptureAt > 1700) {
+                if (readyStreak >= READY_STREAK_NEEDED && now - lastCaptureAt > 1600) {
                     lastCaptureAt = now;
                     takeCapture();
                 }
@@ -319,8 +346,9 @@ async function detectAndGuideFace() {
             faceGuide.classList.remove('ready');
             readyStreak = 0;
             lastAnalysis = null;
-            renderAttrChips(null);
+            renderScanChecklist(null);
             guideText.textContent = 'Nenhum rosto detectado';
+            setStatus('Posicione o rosto na frente da camera.', 'error');
         }
     } catch (error) {
         console.error(error);
@@ -331,20 +359,8 @@ async function detectAndGuideFace() {
 
 function takeCapture() {
     if (captures.length >= REQUIRED_CAPTURES) return;
-    if (lastAnalysis && lastAnalysis.sunglasses) {
-        setStatus('Remova os oculos escuros para capturar.', 'error');
-        return;
-    }
-    if (lastAnalysis && lastAnalysis.hat) {
-        setStatus('Remova chapeu/bone para capturar.', 'error');
-        return;
-    }
-    if (lastAnalysis && !lastAnalysis.eyes_open) {
-        setStatus('Nao foi possivel capturar: olhos fechados.', 'error');
-        return;
-    }
-    if (lastAnalysis && !lastAnalysis.capture_ready) {
-        const reason = (lastAnalysis.capture_blockers && lastAnalysis.capture_blockers[0]) || 'ajuste a pose';
+    if (!lastAnalysis || !lastAnalysis.capture_ready) {
+        const reason = firstPendingDetail(lastAnalysis);
         setStatus('Captura bloqueada: ' + reason + '.', 'error');
         return;
     }
@@ -363,29 +379,13 @@ function takeCapture() {
         document.getElementById('guideText').textContent = 'Pronto!';
         stopCamera();
     } else {
-        const extras = (lastAnalysis && lastAnalysis.accessories && lastAnalysis.accessories.length)
-            ? ' Detectado: ' + lastAnalysis.accessories.join(', ') + '.'
-            : '';
-        setStatus('Captura ' + captures.length + '/' + REQUIRED_CAPTURES + '.' + extras, 'success');
+        setStatus('Captura ' + captures.length + '/' + REQUIRED_CAPTURES + '. Continue o scan.', 'success');
     }
 }
 
 document.getElementById('captureBtn').addEventListener('click', () => {
-    if (lastAnalysis && lastAnalysis.sunglasses) {
-        setStatus('Remova os oculos escuros para capturar.', 'error');
-        return;
-    }
-    if (lastAnalysis && lastAnalysis.hat) {
-        setStatus('Remova chapeu/bone para capturar.', 'error');
-        return;
-    }
-    if (lastAnalysis && !lastAnalysis.eyes_open) {
-        setStatus('Abra os olhos para capturar.', 'error');
-        return;
-    }
-    if (lastAnalysis && !lastAnalysis.capture_ready) {
-        const reason = (lastAnalysis.capture_blockers && lastAnalysis.capture_blockers[0]) || 'ajuste a pose';
-        setStatus('Ainda nao esta pronto: ' + reason + '.', 'error');
+    if (!lastAnalysis || !lastAnalysis.capture_ready) {
+        setStatus('Ainda nao esta pronto: ' + firstPendingDetail(lastAnalysis) + '.', 'error');
         return;
     }
     lastCaptureAt = Date.now();
