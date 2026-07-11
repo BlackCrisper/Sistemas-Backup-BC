@@ -773,6 +773,74 @@ def api_matricula(matricula):
     })
 
 
+@app.route('/api/simulacao/reconhecer', methods=['POST'])
+def api_simulacao_reconhecer():
+    """
+    Reconhecimento 1:N para a simulação (sem matrícula prévia).
+    Retorna candidato quando confidence >= 0.55.
+    """
+    image = None
+    if 'imagem_base64' in request.form:
+        image = decode_base64_image(request.form['imagem_base64'])
+    elif 'imagem' in request.files:
+        file = request.files['imagem']
+        if file and file.filename:
+            nparr = np.frombuffer(file.read(), np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if image is None:
+        return jsonify({'success': False, 'matched': False, 'error': 'Nenhuma imagem fornecida'}), 400
+
+    h, w = image.shape[:2]
+    max_side = 640
+    if max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+        image = cv2.resize(image, (int(w * scale), int(h * scale)))
+
+    results = face_recognizer.detect_and_recognize(image)
+    if not results:
+        return jsonify({
+            'success': True,
+            'matched': False,
+            'message': 'Nenhum rosto detectado',
+            'confidence': 0.0,
+        })
+
+    best = max(results, key=lambda r: r.get('confidence') or 0.0)
+    confidence = float(best.get('confidence') or 0.0)
+    usuario_id = best.get('usuario_id')
+
+    CANDIDATE_THRESHOLD = 0.55
+
+    if not usuario_id or confidence < CANDIDATE_THRESHOLD:
+        return jsonify({
+            'success': True,
+            'matched': False,
+            'message': 'Rosto não reconhecido' if not usuario_id else 'Confiança baixa. Aproxime-se.',
+            'confidence': confidence,
+        })
+
+    usuario = user_with_fotos(db.buscar_usuario(int(usuario_id)))
+    if not usuario:
+        return jsonify({
+            'success': True,
+            'matched': False,
+            'message': 'Usuário não encontrado',
+            'confidence': confidence,
+        })
+
+    return jsonify({
+        'success': True,
+        'matched': True,
+        'message': 'Candidato encontrado',
+        'confidence': confidence,
+        'usuario_id': usuario['id'],
+        'nome': usuario['nome'],
+        'matricula': usuario.get('matricula'),
+        'foto_url': usuario.get('foto_url'),
+    })
+
+
 @app.route('/api/simulacao/validar', methods=['POST'])
 def api_simulacao_validar():
     """

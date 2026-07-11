@@ -1082,6 +1082,55 @@ body.modal-open {
     box-shadow: var(--shadow);
 }
 
+.sim-confirm-card {
+    margin: 28px auto 0;
+    width: min(100%, 380px);
+    background: var(--surface);
+    border-radius: 24px;
+    padding: 28px 24px 24px;
+    text-align: center;
+    box-shadow: var(--shadow);
+}
+
+.sim-confirm-photo {
+    width: 112px;
+    height: 112px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 3px solid var(--accent-soft);
+    margin: 0 auto 16px;
+    display: block;
+}
+
+.sim-confirm-avatar {
+    width: 112px;
+    height: 112px;
+    border-radius: 50%;
+    margin: 0 auto 16px;
+    display: grid;
+    place-items: center;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 2.4rem;
+    font-weight: 700;
+}
+
+.sim-confirm-question {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    margin: 8px 0 20px;
+}
+
+.sim-confirm-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.sim-confirm-actions .btn {
+    min-height: 48px;
+}
+
 .sim-fail-card {
     margin: 48px auto 0;
     width: min(100%, 360px);
