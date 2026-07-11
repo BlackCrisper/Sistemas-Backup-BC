@@ -10,8 +10,7 @@ services:
         sync: false
       - key: REQUIRE_FACE_API_KEY
         value: "1"
-      - key: FACE_DATA_DIR
-        value: /var/data
+      # Sem Disk pago: persistência via Cloudinary (obrigatório em prod)
       - key: CLOUDINARY_CLOUD_NAME
         sync: false
       - key: CLOUDINARY_API_KEY
@@ -19,10 +18,6 @@ services:
       - key: CLOUDINARY_API_SECRET
         sync: false
       - key: FACE_MATCH_THRESHOLD
-        value: "0.80"
+        value: "0.70"
       - key: PYTHON_VERSION
         value: "3.11.9"
-    disk:
-      name: face-data
-      mountPath: /var/data
-      sizeGB: 1

@@ -29,9 +29,19 @@ CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 FACE_API_KEY = os.environ.get('FACE_API_KEY', '').strip()
-CANDIDATE_THRESHOLD = float(os.environ.get('FACE_MATCH_THRESHOLD', '0.80'))
+CANDIDATE_THRESHOLD = float(os.environ.get('FACE_MATCH_THRESHOLD', '0.70'))
 
 db = Database()
+
+# Restaura rostos/embeddings do Cloudinary (sem precisar de Disk pago no Render)
+try:
+    import cloudinary_db
+    restored = cloudinary_db.load_state_from_cloudinary(db)
+    if restored:
+        print(f'Boot: {restored} usuário(s) faciais restaurados do Cloudinary.')
+except Exception as e:
+    print(f'Boot: não foi possível restaurar Cloudinary ({e})')
+
 face_recognizer = FaceRecognizer(db)
 facial_analysis = FacialAnalysis()
 
@@ -55,8 +65,14 @@ def _json_or_form():
     if request.is_json:
         return request.get_json(silent=True) or {}
     data = request.form.to_dict() if request.form else {}
-    # Também aceita campos JSON misturados
     return data
+
+
+def _decode_image_from_request():
+    from face_enroll import decode_base64_image, collect_images_from_payload
+    data = _json_or_form()
+    images = collect_images_from_payload(data, request.files)
+    return images[0] if images else None
 
 
 @app.route('/health', methods=['GET'])
@@ -67,8 +83,97 @@ def health():
         'service': 'face-id',
         'users': len(db.listar_usuarios()),
         'cloudinary': cloudinary_storage.is_configured(),
+        'persistence': 'cloudinary' if cloudinary_storage.is_configured() else 'ephemeral',
         'api_key_required': bool(FACE_API_KEY),
+        'match_threshold': CANDIDATE_THRESHOLD,
     })
+
+
+@app.route('/api/detect', methods=['POST'])
+@require_api_key
+def api_detect():
+    """Detecta rosto + checklist de qualidade para captura automática."""
+    import cv2
+    import numpy as np
+    from face_enroll import decode_base64_image, collect_images_from_payload
+
+    data = _json_or_form()
+    images = collect_images_from_payload(data, request.files)
+    if not images:
+        return jsonify({'error': 'Nenhuma imagem fornecida'}), 400
+
+    image = images[0]
+    h, w = image.shape[:2]
+    max_side = 420
+    scale = 1.0
+    if max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+        image = cv2.resize(image, (int(w * scale), int(h * scale)))
+
+    detailed = face_recognizer.detect_faces_detailed(image)
+    results = []
+    for face in detailed:
+        x, y, fw, fh = face['location']
+        if scale != 1.0:
+            x = int(x / scale)
+            y = int(y / scale)
+            fw = int(fw / scale)
+            fh = int(fh / scale)
+
+        landmarks = face.get('landmarks')
+        scaled_landmarks = None
+        if landmarks and scale != 1.0:
+            scaled_landmarks = {}
+            for key, value in landmarks.items():
+                if isinstance(value, (tuple, list)) and len(value) == 2:
+                    scaled_landmarks[key] = [float(value[0]) / scale, float(value[1]) / scale]
+                else:
+                    scaled_landmarks[key] = value
+        else:
+            scaled_landmarks = landmarks
+
+        fx, fy, ffw, ffh = face['location']
+        try:
+            facial_info = facial_analysis.analyze_full_face(
+                image, (fx, fy, ffw, ffh),
+                landmarks=face.get('landmarks'),
+                frame_shape=image.shape,
+            )
+        except Exception as e:
+            print(f'Erro análise facial: {e}')
+            facial_info = {
+                'capture_ready': False,
+                'capture_blockers': ['falha na análise'],
+                'checks': [],
+                'scan_progress': 0.0,
+            }
+
+        results.append({
+            'location': [int(x), int(y), int(fw), int(fh)],
+            'landmarks': {
+                k: ([float(v[0]), float(v[1])] if isinstance(v, (tuple, list)) and len(v) == 2 else v)
+                for k, v in (scaled_landmarks or {}).items()
+            } if scaled_landmarks else None,
+            'facial_analysis': {
+                'glasses': bool(facial_info.get('glasses', False)),
+                'sunglasses': bool(facial_info.get('sunglasses', False)),
+                'hat': bool(facial_info.get('hat', False)),
+                'eyes_open': bool(facial_info.get('eyes_open', False)),
+                'left_eye': str(facial_info.get('left_eye', 'unknown')),
+                'right_eye': str(facial_info.get('right_eye', 'unknown')),
+                'capture_ready': bool(facial_info.get('capture_ready', False)),
+                'capture_blockers': facial_info.get('capture_blockers', []),
+                'quality': str(facial_info.get('quality', 'poor')),
+                'brightness': float(facial_info.get('brightness', 0.0)),
+                'sharpness': float(facial_info.get('sharpness', 0.0)),
+                'pose_ok': bool(facial_info.get('pose_ok', False)),
+                'position_ok': bool(facial_info.get('position_ok', False)),
+                'scan_progress': float(facial_info.get('scan_progress', 0.0)),
+                'checks': facial_info.get('checks', []),
+            },
+        })
+
+    return jsonify({'success': True, 'results': results})
 
 
 @app.route('/api/enroll', methods=['POST'])
@@ -128,7 +233,7 @@ def api_enroll():
 @app.route('/api/recognize', methods=['POST'])
 @require_api_key
 def api_recognize():
-    """Reconhecimento 1:N (threshold de negócio padrão 0.80)."""
+    """Reconhecimento 1:N (threshold de negócio configurável)."""
     data = _json_or_form()
     images = collect_images_from_payload(data, request.files)
     if not images:
@@ -178,6 +283,11 @@ def api_user_by_matricula(matricula):
     uid = int(usuario['id'])
     face_recognizer.known_faces.pop(uid, None)
     db.deletar_usuario(uid)
+    try:
+        import cloudinary_db
+        cloudinary_db.sync_after_change(db, face_recognizer)
+    except Exception as e:
+        print(f'Falha ao sincronizar Cloudinary após delete: {e}')
     return jsonify({'success': True, 'message': 'Usuário facial removido', 'matricula': matricula})
 
 

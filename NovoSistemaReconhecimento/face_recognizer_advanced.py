@@ -61,7 +61,7 @@ class FaceRecognizer:
 
         self.detector = cv2.FaceDetectorYN.create(
             yunet_path, '', (320, 320),
-            score_threshold=0.6,
+            score_threshold=0.5,
             nms_threshold=0.3,
             top_k=5000
         )
@@ -304,7 +304,13 @@ class FaceRecognizer:
             return None
 
         if not self.known_faces:
-            return None
+            return {
+                'usuario_id': None,
+                'nome': 'Desconhecido',
+                'confidence': 0.0,
+                'matched': False,
+                'reason': 'no_enrolled_faces',
+            }
 
         best_match = None
         best_score = -1.0
@@ -326,23 +332,52 @@ class FaceRecognizer:
             elif user_best > second_best:
                 second_best = user_best
 
-        # Match válido: acima do threshold e com margem sobre o 2º lugar
-        if best_match is None or best_score < self.threshold:
-            return None
+        best_score = float(max(best_score, 0.0))
+
+        # Com 1 único cadastro, SFace 0.40 é fraco demais (qualquer rosto pode passar).
+        # Exige score interno maior quando a galeria é pequena.
+        gallery_users = len(self.known_faces)
+        min_score = self.threshold
+        if gallery_users <= 1:
+            min_score = max(self.threshold, 0.55)
+        elif gallery_users <= 5:
+            min_score = max(self.threshold, 0.48)
+
+        if best_match is None or best_score < min_score:
+            return {
+                'usuario_id': None,
+                'nome': 'Desconhecido',
+                'confidence': best_score,
+                'matched': False,
+                'reason': 'below_internal_threshold',
+            }
 
         margin = best_score - second_best
-        if second_best > 0 and margin < 0.03 and best_score < self.threshold + 0.08:
-            return None
+        # Com poucos usuários, second_best fica ~0 — margem não ajuda; score alto já cobre
+        if gallery_users > 1 and second_best > 0 and margin < 0.03 and best_score < min_score + 0.10:
+            return {
+                'usuario_id': None,
+                'nome': 'Desconhecido',
+                'confidence': best_score,
+                'matched': False,
+                'reason': 'ambiguous',
+            }
 
         usuario = self.database.buscar_usuario(best_match)
         if not usuario:
-            return None
+            return {
+                'usuario_id': None,
+                'nome': 'Desconhecido',
+                'confidence': best_score,
+                'matched': False,
+            }
 
         return {
             'usuario_id': int(best_match),
             'nome': str(usuario['nome']),
             'confidence': float(best_score),
             'distance': float(1.0 - best_score),
+            'matched': True,
         }
 
     def detect_and_recognize(self, image: np.ndarray) -> List[Dict]:
@@ -353,19 +388,22 @@ class FaceRecognizer:
             x, y, w, h = face['location']
             recognition = self.recognize_face(image, face['location'], face_info=face)
 
-            if recognition:
+            if recognition and recognition.get('matched') and recognition.get('usuario_id'):
                 results.append({
                     'location': (int(x), int(y), int(w), int(h)),
                     'usuario_id': recognition['usuario_id'],
                     'nome': recognition['nome'],
                     'confidence': recognition['confidence'],
+                    'face_detected': True,
                 })
             else:
                 results.append({
                     'location': (int(x), int(y), int(w), int(h)),
                     'usuario_id': None,
                     'nome': 'Desconhecido',
-                    'confidence': 0.0,
+                    'confidence': float((recognition or {}).get('confidence') or 0.0),
+                    'face_detected': True,
+                    'reason': (recognition or {}).get('reason'),
                 })
 
         return results

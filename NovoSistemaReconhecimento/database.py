@@ -7,11 +7,33 @@ import pickle
 
 
 def default_db_path():
-    """Usa FACE_DATA_DIR (volume persistente) quando definido."""
+    """Usa FACE_DATA_DIR (volume persistente) quando definido e gravável."""
+    candidates = []
     data_dir = os.environ.get('FACE_DATA_DIR', '').strip()
     if data_dir:
-        os.makedirs(data_dir, exist_ok=True)
-        return os.path.join(data_dir, 'usuarios.db')
+        candidates.append(data_dir)
+    # Fallbacks se o volume do Render não estiver montado / sem permissão
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
+    candidates.append('/tmp/face-id-data')
+
+    for folder in candidates:
+        try:
+            os.makedirs(folder, exist_ok=True)
+            probe = os.path.join(folder, '.write_test')
+            with open(probe, 'w', encoding='utf-8') as f:
+                f.write('ok')
+            os.remove(probe)
+            if folder != data_dir and data_dir:
+                print(
+                    f'AVISO: FACE_DATA_DIR={data_dir!r} inacessível; '
+                    f'usando {folder!r}. Configure um Disk no Render montado em {data_dir}.'
+                )
+            return os.path.join(folder, 'usuarios.db')
+        except OSError as e:
+            print(f'Não foi possível usar data dir {folder!r}: {e}')
+            continue
+
+    # Último recurso: SQLite no diretório atual
     return 'usuarios.db'
 
 

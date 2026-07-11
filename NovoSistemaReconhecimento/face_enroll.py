@@ -101,6 +101,11 @@ def enroll_faces_for_user(
 
     if added > 0:
         face_recognizer.load_known_faces()
+        try:
+            import cloudinary_db
+            cloudinary_db.sync_after_change(db, face_recognizer)
+        except Exception as e:
+            print(f'Falha ao sincronizar Cloudinary após enroll: {e}')
 
     return added, last_error
 
@@ -113,37 +118,101 @@ def resize_for_inference(image: np.ndarray, max_side: int = 640) -> np.ndarray:
     return cv2.resize(image, (int(w * scale), int(h * scale)))
 
 
-def recognize_1n(face_recognizer, image: np.ndarray, threshold: float = 0.80):
-    """Reconhecimento 1:N. Retorna dict com matched/confidence/usuario_id."""
+def recognize_1n(face_recognizer, image: np.ndarray, threshold: float = 0.70):
+    """
+    Reconhecimento 1:N.
+    Só retorna matched=True com confiança alta o bastante — evita falso positivo
+    quando há poucos rostos cadastrados.
+    """
+    import cv2
+    import os
+
+    n_users = len(face_recognizer.known_faces)
+    enrolled = sum(len(v) for v in face_recognizer.known_faces.values())
+
+    # Com poucos cadastros, exige score mais alto (1 rosto no banco tende a "aceitar" qualquer um)
+    base = float(threshold)
+    if n_users <= 1:
+        effective_threshold = max(base, 0.72)
+    elif n_users <= 5:
+        effective_threshold = max(base, 0.65)
+    else:
+        effective_threshold = base
+
+    # Override opcional via env
+    min_env = os.environ.get('FACE_MATCH_THRESHOLD_MIN')
+    if min_env:
+        try:
+            effective_threshold = max(effective_threshold, float(min_env))
+        except ValueError:
+            pass
+
     image = resize_for_inference(image)
     results = face_recognizer.detect_and_recognize(image)
+
+    if not results:
+        flipped = cv2.flip(image, 1)
+        results = face_recognizer.detect_and_recognize(flipped)
+
     if not results:
         return {
             'success': True,
             'matched': False,
-            'message': 'Nenhum rosto detectado',
+            'face_detected': False,
+            'message': 'Nenhum rosto detectado — centralize o rosto e melhore a luz',
             'confidence': 0.0,
+            'enrolled_embeddings': enrolled,
+            'enrolled_users': n_users,
+            'threshold_used': effective_threshold,
         }
 
+    # Melhor candidato por score (mesmo sem match interno)
     best = max(results, key=lambda r: r.get('confidence') or 0.0)
     confidence = float(best.get('confidence') or 0.0)
-    usuario_id = best.get('usuario_id')
+    usuario_id = best.get('usuario_id') if best.get('usuario_id') else None
 
-    if not usuario_id or confidence < threshold:
+    # Reavalia match só pelo limiar de negócio (não confiar só no SFace 0.40)
+    is_match = bool(usuario_id) and confidence >= effective_threshold
+
+    if enrolled == 0 or n_users == 0:
         return {
             'success': True,
             'matched': False,
-            'message': 'Rosto não reconhecido' if not usuario_id else 'Confiança abaixo do limiar. Aproxime-se.',
+            'face_detected': True,
+            'message': 'Rosto visto, mas não há ninguém com foto cadastrada. Cadastre no admin.',
             'confidence': confidence,
+            'enrolled_embeddings': 0,
+            'enrolled_users': 0,
+            'threshold_used': effective_threshold,
+        }
+
+    if not is_match:
+        return {
+            'success': True,
+            'matched': False,
+            'face_detected': True,
+            'message': (
+                'Rosto não cadastrado neste sistema'
+                if confidence < 0.45
+                else f'Não identificado (confiança {int(confidence * 100)}%, mínimo {int(effective_threshold * 100)}%)'
+            ),
+            'confidence': confidence,
+            'enrolled_embeddings': enrolled,
+            'enrolled_users': n_users,
+            'threshold_used': effective_threshold,
         }
 
     return {
         'success': True,
         'matched': True,
-        'message': 'Candidato encontrado',
+        'face_detected': True,
+        'message': 'Identidade confirmada',
         'confidence': confidence,
         'usuario_id': int(usuario_id),
         'nome': best.get('nome'),
+        'enrolled_embeddings': enrolled,
+        'enrolled_users': n_users,
+        'threshold_used': effective_threshold,
     }
 
 
