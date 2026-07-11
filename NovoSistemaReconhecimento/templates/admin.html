@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+
+{% block title %}Admin — FaceID{% endblock %}
+{% block topbar_title %}Admin{% endblock %}
+
+{% block content %}
+<section class="home-hero home-hero-compact">
+    <p class="home-kicker">Administração</p>
+    <h2>Usuários</h2>
+    <p>Gerencie cadastros, fotos e reconhecimento.</p>
+</section>
+
+<div class="actions-row">
+    <a href="{{ url_for('register') }}" class="action-link action-primary">
+        <span class="action-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Zm0 2c-4.4 0-8 2.2-8 5v1h16v-1c0-2.8-3.6-5-8-5Zm7-7h-2V5h-2v2h-2v2h2v2h2V9h2V7Z"/></svg>
+        </span>
+        <strong>Cadastrar</strong>
+        <span>Nova pessoa</span>
+    </a>
+    <a href="{{ url_for('recognize') }}" class="action-link">
+        <span class="action-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M4 7V4h3V2H2v5h2Zm14-3h3v3h2V2h-5v2ZM7 22H2v-5h2v3h3v2Zm15-5v5h-5v-2h3v-3h2ZM8 8h8v8H8V8Zm2 2v4h4v-4h-4Z"/></svg>
+        </span>
+        <strong>Reconhecer</strong>
+        <span>Tempo real</span>
+    </a>
+</div>
+
+<section class="panel panel-list">
+    <div class="panel-head">
+        <h3 class="panel-title">Cadastrados</h3>
+        <span class="panel-count">{{ usuarios|length }}</span>
+    </div>
+    {% if usuarios %}
+    <div class="usuarios-list">
+        {% for usuario in usuarios %}
+        <div class="usuario-item" data-id="{{ usuario.id }}">
+            {% if usuario.foto_url %}
+            <img class="usuario-avatar-img" src="{{ usuario.foto_url }}" alt="{{ usuario.nome }}">
+            {% else %}
+            <div class="usuario-avatar" aria-hidden="true">{{ usuario.nome[:1]|upper }}</div>
+            {% endif %}
+            <div class="usuario-info">
+                <strong>{{ usuario.nome }}</strong>
+                <span class="meta">
+                    Mat. {{ usuario.matricula or '—' }}
+                    · {{ (usuario.fotos|length) if usuario.fotos else 0 }} foto(s)
+                </span>
+            </div>
+            <div class="usuario-actions">
+                <a class="btn btn-secondary btn-sm" href="{{ url_for('admin_edit_user', user_id=usuario.id) }}">Editar</a>
+                <button type="button" class="btn btn-danger btn-sm btn-delete-user"
+                    data-id="{{ usuario.id }}"
+                    data-nome="{{ usuario.nome }}">
+                    Remover
+                </button>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="no-data">Nenhum usuário ainda.<br>Toque em Cadastrar para começar.</p>
+    {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.btn-delete-user').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+        if (!confirm('Remover "' + btn.dataset.nome + '"?')) return;
+        try {
+            const response = await fetch('/api/users/' + btn.dataset.id, { method: 'DELETE' });
+            const data = await response.json();
+            if (data.success) location.reload();
+            else alert(data.error || 'Erro ao remover usuário');
+        } catch (error) {
+            alert('Erro: ' + error.message);
+        }
+    });
+});
+</script>
+{% endblock %}

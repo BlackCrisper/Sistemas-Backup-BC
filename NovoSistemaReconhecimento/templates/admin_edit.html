@@ -1,0 +1,384 @@
+{% extends "base.html" %}
+
+{% block title %}Editar — {{ usuario.nome }}{% endblock %}
+{% block topbar_title %}Editar{% endblock %}
+
+{% block content %}
+<div class="page-header page-header-compact">
+    <h2>{{ usuario.nome }}</h2>
+    <p>Mat. {{ usuario.matricula }} · edite dados ou refaça o rosto</p>
+</div>
+
+<div class="panel panel-wide">
+    <form id="editForm">
+        <div class="form-group">
+            <label for="editNome">Nome</label>
+            <input type="text" id="editNome" value="{{ usuario.nome }}" required autocomplete="name">
+        </div>
+        <div class="form-group">
+            <label for="editMatricula">Matrícula</label>
+            <input type="text" id="editMatricula" value="{{ usuario.matricula }}" required maxlength="3" inputmode="numeric" pattern="[0-9]{3}">
+        </div>
+        <div id="editError" class="message error" style="display:none;"></div>
+        <div class="form-actions form-actions-inline">
+            <button type="submit" class="btn btn-primary">Salvar dados</button>
+            <a href="{{ url_for('admin') }}" class="btn btn-secondary">Voltar</a>
+        </div>
+    </form>
+</div>
+
+<section class="panel panel-wide">
+    <div class="panel-head">
+        <h3 class="panel-title">Fotos cadastradas</h3>
+        <span class="panel-count">{{ usuario.fotos|length }}</span>
+    </div>
+    {% if usuario.fotos %}
+    <div class="photo-grid" id="photoGrid">
+        {% for foto in usuario.fotos %}
+        <a class="photo-grid-item" href="{{ foto.url }}" target="_blank" rel="noopener">
+            <img src="{{ foto.url }}" alt="Foto {{ loop.index }}">
+        </a>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="no-data">Nenhuma foto ainda.</p>
+    {% endif %}
+</section>
+
+<section class="panel panel-wide">
+    <div class="page-header page-header-compact" style="margin-bottom:12px;">
+        <h3 class="panel-title">Refazer cadastro do rosto</h3>
+        <p>3 novas fotos substituem as atuais (olhos abertos, sem óculos escuros/boné).</p>
+    </div>
+
+    <div class="form-group">
+        <label>Capturas <span id="captureCountLabel" style="font-weight:400;color:var(--text-muted)">0/3</span></label>
+        <div class="camera-stage" id="cameraStage">
+            <div class="camera-placeholder" id="cameraPlaceholder">Câmera desligada</div>
+            <video id="video" autoplay playsinline muted style="display:none;"></video>
+            <canvas id="canvas" style="display:none;"></canvas>
+            <canvas id="overlayCanvas" style="display:none;"></canvas>
+            <div id="faceGuide" class="face-guide" style="display:none;">
+                <div class="guide-frame"></div>
+                <div class="guide-text" id="guideText">Centralize o rosto</div>
+            </div>
+        </div>
+        <div id="attrChips" class="attr-chips" aria-live="polite"></div>
+        <div id="thumbs" class="thumbs" style="display:none;"></div>
+        <div class="capture-controls">
+            <button type="button" id="startWebcamBtn" class="btn btn-primary">Iniciar câmera</button>
+            <button type="button" id="stopWebcamBtn" class="btn btn-secondary" style="display:none;">Parar</button>
+            <button type="button" id="captureBtn" class="btn btn-secondary" style="display:none;">Capturar</button>
+            <button type="button" id="clearCapturesBtn" class="btn btn-secondary" style="display:none;">Limpar</button>
+        </div>
+        <div id="cameraStatus" class="status-bar"></div>
+    </div>
+
+    <div class="form-actions form-actions-inline">
+        <button type="button" class="btn btn-primary" id="saveFacesBtn" disabled>Salvar novo rosto</button>
+    </div>
+    <div id="faceMessage" class="message" style="display:none;"></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<style>
+.thumbs {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-top: 12px;
+}
+.thumbs img {
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+}
+.attr-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+    min-height: 28px;
+}
+.attr-chip {
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--bg-accent);
+    color: var(--text-muted);
+}
+.attr-chip.ok { background: var(--success-soft); color: var(--success); }
+.attr-chip.warn { background: var(--warning-soft); color: var(--warning); }
+.attr-chip.info { background: var(--accent-soft); color: var(--accent); }
+</style>
+<script>
+const USER_ID = {{ usuario.id }};
+const REQUIRED_CAPTURES = 3;
+let stream = null;
+let detectInterval = null;
+let isDetecting = false;
+let captures = [];
+let lastCaptureAt = 0;
+let lastAnalysis = null;
+let readyStreak = 0;
+
+function setStatus(text, type) {
+    const el = document.getElementById('cameraStatus');
+    el.textContent = text || '';
+    el.className = 'status-bar' + (type ? ' ' + type : '');
+}
+
+function renderAttrChips(fa) {
+    const box = document.getElementById('attrChips');
+    if (!fa) { box.innerHTML = ''; return; }
+    const chips = [];
+    if (fa.sunglasses) chips.push(['Oculos escuros — remova', 'warn']);
+    else chips.push(fa.eyes_open ? ['Olhos abertos', 'ok'] : ['Abra os olhos', 'warn']);
+    if (fa.hat) chips.push(['Chapeu/bone — remova', 'warn']);
+    if (fa.capture_ready) chips.push(['Pronto', 'ok']);
+    box.innerHTML = chips.map(([label, cls]) =>
+        '<span class="attr-chip ' + cls + '">' + label + '</span>'
+    ).join('');
+}
+
+function updateCaptureUI() {
+    document.getElementById('captureCountLabel').textContent = captures.length + '/' + REQUIRED_CAPTURES;
+    const thumbs = document.getElementById('thumbs');
+    thumbs.innerHTML = '';
+    if (captures.length) {
+        thumbs.style.display = 'grid';
+        captures.forEach((src) => {
+            const img = document.createElement('img');
+            img.src = src;
+            thumbs.appendChild(img);
+        });
+        document.getElementById('clearCapturesBtn').style.display = 'inline-flex';
+    } else {
+        thumbs.style.display = 'none';
+        document.getElementById('clearCapturesBtn').style.display = 'none';
+    }
+    document.getElementById('saveFacesBtn').disabled = captures.length < REQUIRED_CAPTURES;
+}
+
+function stopCamera() {
+    if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    const video = document.getElementById('video');
+    video.srcObject = null;
+    video.style.display = 'none';
+    document.getElementById('overlayCanvas').style.display = 'none';
+    document.getElementById('faceGuide').style.display = 'none';
+    document.getElementById('cameraPlaceholder').style.display = 'block';
+    document.getElementById('cameraStage').classList.remove('is-active');
+    document.getElementById('startWebcamBtn').style.display = 'inline-flex';
+    document.getElementById('stopWebcamBtn').style.display = 'none';
+    document.getElementById('captureBtn').style.display = 'none';
+    readyStreak = 0;
+}
+
+document.getElementById('startWebcamBtn').addEventListener('click', async () => {
+    setStatus('Solicitando camera...');
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+        });
+        const video = document.getElementById('video');
+        video.srcObject = stream;
+        video.style.display = 'block';
+        await video.play();
+        document.getElementById('cameraPlaceholder').style.display = 'none';
+        document.getElementById('cameraStage').classList.add('is-active');
+        document.getElementById('faceGuide').style.display = 'block';
+        document.getElementById('startWebcamBtn').style.display = 'none';
+        document.getElementById('stopWebcamBtn').style.display = 'inline-flex';
+        document.getElementById('captureBtn').style.display = 'inline-flex';
+        setStatus('Capture ' + REQUIRED_CAPTURES + ' fotos.');
+        detectInterval = setInterval(detectAndGuideFace, 500);
+    } catch (error) {
+        setStatus('Erro camera: ' + (error.message || error.name), 'error');
+    }
+});
+
+document.getElementById('stopWebcamBtn').addEventListener('click', () => {
+    stopCamera();
+    renderAttrChips(null);
+    setStatus('Camera desligada.');
+});
+
+document.getElementById('clearCapturesBtn').addEventListener('click', () => {
+    captures = [];
+    updateCaptureUI();
+    setStatus('Fotos limpas.');
+});
+
+async function detectAndGuideFace() {
+    if (isDetecting || captures.length >= REQUIRED_CAPTURES) return;
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const overlayCanvas = document.getElementById('overlayCanvas');
+    const guideText = document.getElementById('guideText');
+    const faceGuide = document.getElementById('faceGuide');
+    if (!video.srcObject || video.readyState < 2 || video.videoWidth === 0) return;
+
+    isDetecting = true;
+    try {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        const formData = new FormData();
+        formData.append('imagem_base64', canvas.toDataURL('image/jpeg', 0.65));
+        const response = await fetch('{{ url_for("api_detect") }}', { method: 'POST', body: formData });
+        const data = await response.json();
+
+        overlayCanvas.width = video.videoWidth;
+        overlayCanvas.height = video.videoHeight;
+        const ctx = overlayCanvas.getContext('2d');
+        ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+        if (data.success && data.results && data.results.length > 0) {
+            const face = data.results[0];
+            const [x, y, w, h] = face.location;
+            const fa = face.facial_analysis || {};
+            lastAnalysis = fa;
+            renderAttrChips(fa);
+            overlayCanvas.style.display = 'block';
+            const ready = !!fa.capture_ready && !fa.sunglasses && !fa.hat;
+            ctx.strokeStyle = ready ? '#3dd68c' : '#f5a524';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x, y, w, h);
+
+            if (fa.sunglasses) {
+                faceGuide.classList.remove('ready'); readyStreak = 0;
+                guideText.textContent = 'Remova os oculos escuros';
+            } else if (fa.hat) {
+                faceGuide.classList.remove('ready'); readyStreak = 0;
+                guideText.textContent = 'Remova chapeu/bone';
+            } else if (!fa.eyes_open) {
+                faceGuide.classList.remove('ready'); readyStreak = 0;
+                guideText.textContent = 'Abra os olhos';
+            } else if (!ready) {
+                faceGuide.classList.remove('ready'); readyStreak = 0;
+                guideText.textContent = (fa.capture_blockers && fa.capture_blockers[0]) || 'Ajuste a pose';
+            } else {
+                faceGuide.classList.add('ready');
+                readyStreak += 1;
+                guideText.textContent = 'Foto ' + (captures.length + 1) + '/' + REQUIRED_CAPTURES;
+                const now = Date.now();
+                if (readyStreak >= 2 && now - lastCaptureAt > 1700) {
+                    lastCaptureAt = now;
+                    takeCapture();
+                }
+            }
+        } else {
+            overlayCanvas.style.display = 'none';
+            faceGuide.classList.remove('ready');
+            readyStreak = 0;
+            lastAnalysis = null;
+            renderAttrChips(null);
+            guideText.textContent = 'Nenhum rosto detectado';
+        }
+    } catch (e) {
+        console.error(e);
+    } finally {
+        isDetecting = false;
+    }
+}
+
+function takeCapture() {
+    if (captures.length >= REQUIRED_CAPTURES) return;
+    if (lastAnalysis && (lastAnalysis.sunglasses || lastAnalysis.hat || !lastAnalysis.capture_ready)) {
+        setStatus('Ainda nao esta pronto para capturar.', 'error');
+        return;
+    }
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    captures.push(canvas.toDataURL('image/jpeg', 0.92));
+    updateCaptureUI();
+    readyStreak = 0;
+    if (captures.length >= REQUIRED_CAPTURES) {
+        document.getElementById('guideText').textContent = 'Pronto!';
+        stopCamera();
+        setStatus(REQUIRED_CAPTURES + ' fotos capturadas. Salve o novo rosto.', 'success');
+    }
+}
+
+document.getElementById('captureBtn').addEventListener('click', () => {
+    lastCaptureAt = Date.now();
+    takeCapture();
+});
+
+document.getElementById('editForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById('editError');
+    errEl.style.display = 'none';
+    try {
+        const response = await fetch('/api/users/' + USER_ID, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                nome: document.getElementById('editNome').value.trim(),
+                matricula: document.getElementById('editMatricula').value.trim()
+            })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            errEl.textContent = data.error || 'Erro ao salvar';
+            errEl.style.display = 'block';
+            return;
+        }
+        location.reload();
+    } catch (error) {
+        errEl.textContent = 'Erro: ' + error.message;
+        errEl.style.display = 'block';
+    }
+});
+
+document.getElementById('saveFacesBtn').addEventListener('click', async () => {
+    const msg = document.getElementById('faceMessage');
+    msg.style.display = 'none';
+    if (captures.length < REQUIRED_CAPTURES) {
+        msg.textContent = 'Capture ' + REQUIRED_CAPTURES + ' fotos.';
+        msg.className = 'message error';
+        msg.style.display = 'block';
+        return;
+    }
+    const btn = document.getElementById('saveFacesBtn');
+    btn.disabled = true;
+    btn.textContent = 'Salvando...';
+    const formData = new FormData();
+    captures.forEach((src, i) => formData.append('imagem_base64_' + i, src));
+    try {
+        const response = await fetch('/api/users/' + USER_ID + '/faces', { method: 'POST', body: formData });
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            msg.textContent = data.error || 'Erro ao atualizar rosto';
+            msg.className = 'message error';
+            msg.style.display = 'block';
+            btn.disabled = false;
+            btn.textContent = 'Salvar novo rosto';
+            return;
+        }
+        msg.textContent = data.message || 'Rosto atualizado.';
+        msg.className = 'message success';
+        msg.style.display = 'block';
+        setTimeout(() => location.reload(), 900);
+    } catch (error) {
+        msg.textContent = 'Erro: ' + error.message;
+        msg.className = 'message error';
+        msg.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Salvar novo rosto';
+    }
+});
+
+window.addEventListener('beforeunload', stopCamera);
+</script>
+{% endblock %}

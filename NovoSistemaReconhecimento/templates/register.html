@@ -53,7 +53,7 @@
 
         <div class="form-actions">
             <button type="submit" class="btn btn-primary" id="submitBtn" disabled>Cadastrar</button>
-            <a href="{{ url_for('index') }}" class="btn btn-secondary">Cancelar</a>
+            <a href="{{ url_for('admin') }}" class="btn btn-secondary">Cancelar</a>
         </div>
 
         <div id="message" class="message" style="display:none;"></div>
@@ -444,7 +444,7 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
             messageDiv.textContent = data.message || 'Usuario cadastrado.';
             messageDiv.className = 'message success';
             messageDiv.style.display = 'block';
-            setTimeout(() => { window.location.href = '{{ url_for("index") }}'; }, 1200);
+            setTimeout(() => { window.location.href = '{{ url_for("admin") }}'; }, 1200);
         } else {
             messageDiv.textContent = data.error || 'Erro ao cadastrar.';
             messageDiv.className = 'message error';

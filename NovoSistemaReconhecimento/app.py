@@ -70,16 +70,128 @@ def favicon():
     )
 
 
+def collect_images_from_request():
+    """Extrai imagens de upload/base64 do request atual."""
+    images = []
+
+    if 'imagem' in request.files:
+        file = request.files['imagem']
+        if file and file.filename and allowed_file(file.filename):
+            image_bytes = file.read()
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is not None:
+                images.append(img)
+
+    if 'imagem_base64' in request.form and request.form['imagem_base64']:
+        img = decode_base64_image(request.form['imagem_base64'])
+        if img is not None:
+            images.append(img)
+
+    for key in sorted(request.form.keys()):
+        if key.startswith('imagem_base64_'):
+            img = decode_base64_image(request.form[key])
+            if img is not None:
+                images.append(img)
+
+    return images
+
+
+def enroll_faces_for_user(usuario_id, images, replace=False):
+    """
+    Valida e cadastra faces para um usuário.
+    Retorna (added_count, last_error).
+    """
+    if replace:
+        db.limpar_encodings(usuario_id)
+        db.limpar_fotos(usuario_id)
+        face_recognizer.known_faces.pop(int(usuario_id), None)
+
+    user_dir = os.path.join('faces', str(usuario_id))
+    os.makedirs(user_dir, exist_ok=True)
+
+    added = 0
+    last_error = 'Nenhum rosto válido encontrado'
+    existing = len(db.listar_fotos(usuario_id))
+
+    for idx, image in enumerate(images):
+        filepath = os.path.join(user_dir, f'face_{usuario_id}_{existing + idx}.jpg')
+        cv2.imwrite(filepath, image)
+
+        detailed = face_recognizer.detect_faces_detailed(image)
+        if not detailed:
+            last_error = 'Nenhum rosto detectado. Centralize o rosto e melhore a iluminação.'
+            continue
+        if len(detailed) > 1:
+            last_error = 'Múltiplos rostos detectados. Cadastre uma pessoa por vez.'
+            continue
+
+        face = detailed[0]
+        try:
+            facial_info = facial_analysis.analyze_full_face(
+                image, face['location'], landmarks=face.get('landmarks')
+            )
+        except Exception as e:
+            print(f'Erro análise no cadastro: {e}')
+            facial_info = {'capture_blockers': ['falha na análise'], 'capture_ready': False}
+
+        if facial_info.get('sunglasses'):
+            last_error = 'Remova os óculos escuros para cadastrar.'
+            continue
+        if facial_info.get('hat'):
+            last_error = 'Remova chapéu/boné para cadastrar.'
+            continue
+        if facial_info.get('capture_blockers'):
+            last_error = 'Corrija: ' + ', '.join(facial_info['capture_blockers'])
+            continue
+
+        success, message = face_recognizer.validate_and_add_face(
+            usuario_id, image, face['location']
+        )
+        if success:
+            added += 1
+        else:
+            last_error = message
+
+    if added > 0:
+        face_recognizer.load_known_faces()
+
+    return added, last_error
+
+
+def user_with_fotos(usuario):
+    """Anexa foto_url e lista de fotos ao dict do usuário."""
+    if not usuario:
+        return None
+    u = dict(usuario)
+    fotos = db.listar_fotos(u['id'])
+    u['fotos'] = [
+        {'filename': f, 'url': url_for('serve_face', user_id=u['id'], filename=f)}
+        for f in fotos
+    ]
+    u['foto_url'] = u['fotos'][0]['url'] if u['fotos'] else None
+    return u
+
+
 @app.route('/')
 def index():
-    """Página inicial"""
-    usuarios = db.listar_usuarios()
-    for u in usuarios:
-        foto = db.foto_usuario(u['id'])
-        u['foto_url'] = url_for('serve_face', user_id=u['id'], filename=foto) if foto else None
-    return render_template('index.html', usuarios=usuarios)
+    """Tela inicial: simulação de ponto facial."""
+    return render_template('simulacao.html')
 
 
+@app.route('/simulacao')
+def simulacao_redirect():
+    return redirect(url_for('index'))
+
+
+@app.route('/admin')
+def admin():
+    """Painel admin: listagem e gestão de usuários."""
+    usuarios = [user_with_fotos(u) for u in db.listar_usuarios()]
+    return render_template('admin.html', usuarios=usuarios)
+
+
+@app.route('/admin/cadastrar', methods=['GET', 'POST'])
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     """Página de cadastro de nova face"""
@@ -92,32 +204,7 @@ def register():
         if not matricula:
             return jsonify({'error': 'Matrícula deve ter exatamente 3 dígitos'}), 400
 
-        # Aceita uma ou várias imagens (imagem_base64 / imagem_base64_0..)
-        images = []
-
-        # Upload de arquivo único
-        if 'imagem' in request.files:
-            file = request.files['imagem']
-            if file and file.filename and allowed_file(file.filename):
-                image_bytes = file.read()
-                nparr = np.frombuffer(image_bytes, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if img is not None:
-                    images.append(img)
-
-        # Base64 único
-        if 'imagem_base64' in request.form and request.form['imagem_base64']:
-            img = decode_base64_image(request.form['imagem_base64'])
-            if img is not None:
-                images.append(img)
-
-        # Múltiplas capturas
-        for key in sorted(request.form.keys()):
-            if key.startswith('imagem_base64_'):
-                img = decode_base64_image(request.form[key])
-                if img is not None:
-                    images.append(img)
-
+        images = collect_images_from_request()
         if not images:
             return jsonify({'error': 'Nenhuma imagem fornecida'}), 400
 
@@ -125,56 +212,10 @@ def register():
         if usuario_id is None:
             return jsonify({'error': 'Erro ao criar usuário. Matrícula inválida ou já cadastrada.'}), 400
 
-        user_dir = os.path.join('faces', str(usuario_id))
-        os.makedirs(user_dir, exist_ok=True)
-
-        added = 0
-        last_error = 'Nenhum rosto válido encontrado'
-
-        for idx, image in enumerate(images):
-            filepath = os.path.join(user_dir, f'face_{usuario_id}_{idx}.jpg')
-            cv2.imwrite(filepath, image)
-
-            detailed = face_recognizer.detect_faces_detailed(image)
-            if not detailed:
-                last_error = 'Nenhum rosto detectado. Centralize o rosto e melhore a iluminação.'
-                continue
-            if len(detailed) > 1:
-                last_error = 'Múltiplos rostos detectados. Cadastre uma pessoa por vez.'
-                continue
-
-            face = detailed[0]
-            try:
-                facial_info = facial_analysis.analyze_full_face(
-                    image, face['location'], landmarks=face.get('landmarks')
-                )
-            except Exception as e:
-                print(f'Erro análise no cadastro: {e}')
-                facial_info = {'capture_blockers': ['falha na análise'], 'capture_ready': False}
-
-            if facial_info.get('sunglasses'):
-                last_error = 'Remova os óculos escuros para cadastrar.'
-                continue
-            if facial_info.get('hat'):
-                last_error = 'Remova chapéu/boné para cadastrar.'
-                continue
-            if facial_info.get('capture_blockers'):
-                last_error = 'Corrija: ' + ', '.join(facial_info['capture_blockers'])
-                continue
-
-            success, message = face_recognizer.validate_and_add_face(
-                usuario_id, image, face['location']
-            )
-            if success:
-                added += 1
-            else:
-                last_error = message
-
+        added, last_error = enroll_faces_for_user(usuario_id, images, replace=False)
         if added == 0:
             db.deletar_usuario(usuario_id)
             return jsonify({'error': last_error}), 400
-
-        face_recognizer.load_known_faces()
 
         return jsonify({
             'success': True,
@@ -187,18 +228,7 @@ def register():
     return render_template('register.html')
 
 
-def decode_base64_image(base64_string):
-    """Decodifica imagem base64 para array OpenCV."""
-    try:
-        if ',' in base64_string:
-            base64_string = base64_string.split(',')[1]
-        image_data = base64.b64decode(base64_string)
-        nparr = np.frombuffer(image_data, np.uint8)
-        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    except Exception:
-        return None
-
-
+@app.route('/admin/reconhecer', methods=['GET', 'POST'])
 @app.route('/recognize', methods=['GET', 'POST'])
 def recognize():
     """Página de reconhecimento facial"""
@@ -222,7 +252,6 @@ def recognize():
         if image is None:
             return jsonify({'error': 'Erro ao processar imagem'}), 400
 
-        # Reduz resolução no stream para ganhar velocidade
         if stream_mode:
             h, w = image.shape[:2]
             max_side = 640
@@ -251,7 +280,6 @@ def recognize():
             'results': results_serializable,
         }
 
-        # Imagem anotada só no modo upload (não no stream)
         if not stream_mode:
             labels = []
             for result in results:
@@ -268,6 +296,27 @@ def recognize():
         return jsonify(response)
 
     return render_template('recognize.html')
+
+
+@app.route('/admin/usuarios/<int:user_id>')
+def admin_edit_user(user_id):
+    """Edição de usuário: dados, fotos e recadastro de rosto."""
+    usuario = user_with_fotos(db.buscar_usuario(user_id))
+    if not usuario:
+        return redirect(url_for('admin'))
+    return render_template('admin_edit.html', usuario=usuario)
+
+
+def decode_base64_image(base64_string):
+    """Decodifica imagem base64 para array OpenCV."""
+    try:
+        if ',' in base64_string:
+            base64_string = base64_string.split(',')[1]
+        image_data = base64.b64decode(base64_string)
+        nparr = np.frombuffer(image_data, np.uint8)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
 
 
 @app.route('/api/detect', methods=['POST'])
@@ -645,10 +694,7 @@ def api_recognize():
 @app.route('/api/users', methods=['GET'])
 def api_users():
     """API para listar usuários"""
-    usuarios = db.listar_usuarios()
-    for u in usuarios:
-        foto = db.foto_usuario(u['id'])
-        u['foto_url'] = url_for('serve_face', user_id=u['id'], filename=foto) if foto else None
+    usuarios = [user_with_fotos(u) for u in db.listar_usuarios()]
     return jsonify({'usuarios': usuarios})
 
 
@@ -656,11 +702,9 @@ def api_users():
 def api_user(user_id):
     """API para obter, atualizar ou deletar usuário"""
     if request.method == 'GET':
-        usuario = db.buscar_usuario(user_id)
+        usuario = user_with_fotos(db.buscar_usuario(user_id))
         if not usuario:
             return jsonify({'error': 'Usuário não encontrado'}), 404
-        foto = db.foto_usuario(user_id)
-        usuario['foto_url'] = url_for('serve_face', user_id=user_id, filename=foto) if foto else None
         return jsonify({'success': True, 'usuario': usuario})
 
     if request.method == 'PUT':
@@ -670,14 +714,37 @@ def api_user(user_id):
         ok, err = db.atualizar_usuario(user_id, nome, matricula)
         if not ok:
             return jsonify({'error': err}), 400
-        usuario = db.buscar_usuario(user_id)
-        foto = db.foto_usuario(user_id)
-        usuario['foto_url'] = url_for('serve_face', user_id=user_id, filename=foto) if foto else None
-        return jsonify({'success': True, 'usuario': usuario})
+        return jsonify({'success': True, 'usuario': user_with_fotos(db.buscar_usuario(user_id))})
 
     db.deletar_usuario(user_id)
     face_recognizer.load_known_faces()
     return jsonify({'success': True, 'message': 'Usuário deletado com sucesso'})
+
+
+@app.route('/api/users/<int:user_id>/faces', methods=['GET', 'POST'])
+def api_user_faces(user_id):
+    """Lista ou substitui fotos/face do usuário."""
+    usuario = db.buscar_usuario(user_id)
+    if not usuario:
+        return jsonify({'error': 'Usuário não encontrado'}), 404
+
+    if request.method == 'GET':
+        return jsonify({'success': True, 'usuario': user_with_fotos(usuario)})
+
+    images = collect_images_from_request()
+    if not images:
+        return jsonify({'error': 'Nenhuma imagem fornecida'}), 400
+
+    added, last_error = enroll_faces_for_user(user_id, images, replace=True)
+    if added == 0:
+        return jsonify({'error': last_error}), 400
+
+    return jsonify({
+        'success': True,
+        'message': f'Rosto atualizado com {added} amostra(s).',
+        'samples': added,
+        'usuario': user_with_fotos(db.buscar_usuario(user_id)),
+    })
 
 
 @app.route('/faces/<int:user_id>/<path:filename>')
@@ -694,22 +761,16 @@ def api_matricula(matricula):
     usuario = db.buscar_usuario_por_matricula(matricula)
     if not usuario:
         return jsonify({'success': False, 'error': 'Matrícula não encontrada'}), 404
-    foto = db.foto_usuario(usuario['id'])
+    u = user_with_fotos(usuario)
     return jsonify({
         'success': True,
         'usuario': {
-            'id': usuario['id'],
-            'nome': usuario['nome'],
-            'matricula': usuario['matricula'],
-            'foto_url': url_for('serve_face', user_id=usuario['id'], filename=foto) if foto else None,
+            'id': u['id'],
+            'nome': u['nome'],
+            'matricula': u['matricula'],
+            'foto_url': u['foto_url'],
         }
     })
-
-
-@app.route('/simulacao')
-def simulacao():
-    """Fluxo de simulação: matrícula + reconhecimento 1:1."""
-    return render_template('simulacao.html')
 
 
 @app.route('/api/simulacao/validar', methods=['POST'])

@@ -214,14 +214,37 @@ class Database:
         """
         Retorna o nome do primeiro arquivo de foto do usuário, ou None.
         """
+        fotos = self.listar_fotos(usuario_id)
+        return fotos[0] if fotos else None
+
+    def listar_fotos(self, usuario_id):
+        """Lista nomes de arquivos de foto do usuário."""
         user_dir = os.path.join('faces', str(usuario_id))
         if not os.path.isdir(user_dir):
-            return None
-        files = sorted(
+            return []
+        return sorted(
             f for f in os.listdir(user_dir)
             if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp'))
         )
-        return files[0] if files else None
+
+    def limpar_encodings(self, usuario_id):
+        """Remove todos os encodings faciais do usuário."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM face_encodings WHERE usuario_id = ?', (usuario_id,))
+        conn.commit()
+        conn.close()
+
+    def limpar_fotos(self, usuario_id):
+        """Remove arquivos de foto do usuário (mantém a pasta)."""
+        user_dir = os.path.join('faces', str(usuario_id))
+        if not os.path.isdir(user_dir):
+            return
+        for name in self.listar_fotos(usuario_id):
+            try:
+                os.remove(os.path.join(user_dir, name))
+            except OSError:
+                pass
 
     def adicionar_encoding(self, usuario_id, encoding):
         """
