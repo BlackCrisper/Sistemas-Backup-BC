@@ -1,0 +1,390 @@
+{% extends "base.html" %}
+
+{% block title %}Simulação — FaceID{% endblock %}
+{% block topbar_title %}Simulação{% endblock %}
+
+{% block content %}
+<div class="sim-flow">
+    <!-- Etapa 1: Início -->
+    <section id="stepStart" class="sim-step">
+        <div class="sim-hero">
+            <p class="home-kicker">Simulação de acesso</p>
+            <h2>Ponto facial</h2>
+            <p>Digite a matrícula e confirme o rosto na câmera.</p>
+            <button type="button" id="btnStart" class="btn btn-primary btn-lg">Iniciar</button>
+        </div>
+    </section>
+
+    <!-- Etapa 2: Teclado -->
+    <section id="stepKeypad" class="sim-step" hidden>
+        <div class="sim-keypad-wrap">
+            <p class="sim-label">Digite sua matrícula</p>
+            <div id="matriculaDisplay" class="matricula-display" aria-live="polite">
+                <span class="digit empty">_</span>
+                <span class="digit empty">_</span>
+                <span class="digit empty">_</span>
+            </div>
+            <p id="keypadStatus" class="status-bar"></p>
+            <div class="numpad" role="group" aria-label="Teclado numérico">
+                <button type="button" class="numpad-key" data-key="1">1</button>
+                <button type="button" class="numpad-key" data-key="2">2</button>
+                <button type="button" class="numpad-key" data-key="3">3</button>
+                <button type="button" class="numpad-key" data-key="4">4</button>
+                <button type="button" class="numpad-key" data-key="5">5</button>
+                <button type="button" class="numpad-key" data-key="6">6</button>
+                <button type="button" class="numpad-key" data-key="7">7</button>
+                <button type="button" class="numpad-key" data-key="8">8</button>
+                <button type="button" class="numpad-key" data-key="9">9</button>
+                <button type="button" class="numpad-key numpad-action" data-key="clear">C</button>
+                <button type="button" class="numpad-key" data-key="0">0</button>
+                <button type="button" class="numpad-key numpad-action" data-key="back">⌫</button>
+            </div>
+            <button type="button" id="btnConfirmMatricula" class="btn btn-primary" disabled>Confirmar</button>
+            <button type="button" id="btnBackStart" class="btn btn-secondary">Voltar</button>
+        </div>
+    </section>
+
+    <!-- Etapa 3: Câmera -->
+    <section id="stepCamera" class="sim-step" hidden>
+        <div class="sim-camera-wrap">
+            <p class="sim-label">Confirme o rosto · Mat. <strong id="cameraMatricula">—</strong></p>
+            <div class="camera-stage" id="cameraStage">
+                <div class="camera-placeholder" id="cameraPlaceholder">Iniciando câmera...</div>
+                <video id="video" autoplay playsinline muted style="display:none;"></video>
+                <canvas id="canvas" style="display:none;"></canvas>
+                <canvas id="overlay" style="display:none;"></canvas>
+            </div>
+            <p id="cameraStatus" class="status-bar"></p>
+            <div class="btn-row">
+                <button type="button" id="btnBackKeypad" class="btn btn-secondary">Trocar matrícula</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- Etapa falha -->
+    <section id="stepFail" class="sim-step" hidden>
+        <div class="sim-fail-card">
+            <p class="sim-fail-icon" aria-hidden="true">✕</p>
+            <p class="match-label sim-fail-label">Falha</p>
+            <h2 class="match-name">Não reconhecido</h2>
+            <p id="failMessage" class="match-confidence">Tempo esgotado. Tente novamente.</p>
+        </div>
+    </section>
+
+    <!-- Etapa 4: Boas-vindas -->
+    <section id="stepWelcome" class="sim-step" hidden>
+        <div class="sim-welcome match-modal-card sim-welcome-card">
+            <div class="match-check" aria-hidden="true">
+                <svg viewBox="0 0 52 52">
+                    <circle class="match-check-circle" cx="26" cy="26" r="24" fill="none"/>
+                    <path class="match-check-mark" fill="none" d="M14 27l8 8 16-16"/>
+                </svg>
+            </div>
+            <p class="match-label">Bem-vindo</p>
+            <h2 id="welcomeName" class="match-name">—</h2>
+            <p id="welcomeMeta" class="match-confidence"></p>
+            <button type="button" id="btnNewSim" class="btn btn-primary">Nova simulação</button>
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SIM_STREAK = 2;
+const RECOG_TIMEOUT_MS = 5000;
+const FAIL_DISPLAY_MS = 2000;
+
+let matriculaDigits = '';
+let currentMatricula = '';
+let currentUserName = '';
+let stream = null;
+let validateInterval = null;
+let recogDeadline = 0;
+let recogTimer = null;
+let failReturnTimer = null;
+let isProcessing = false;
+let matchStreak = 0;
+let finished = false;
+
+function showStep(id) {
+    ['stepStart', 'stepKeypad', 'stepCamera', 'stepFail', 'stepWelcome'].forEach((stepId) => {
+        document.getElementById(stepId).hidden = stepId !== id;
+    });
+    if (id === 'stepWelcome') {
+        document.getElementById('stepWelcome').classList.add('is-open');
+    } else {
+        document.getElementById('stepWelcome').classList.remove('is-open');
+    }
+}
+
+function setKeypadStatus(text, type = '') {
+    const el = document.getElementById('keypadStatus');
+    el.textContent = text || '';
+    el.className = 'status-bar' + (type ? ' ' + type : '');
+}
+
+function setCameraStatus(text, type = '') {
+    const el = document.getElementById('cameraStatus');
+    el.textContent = text || '';
+    el.className = 'status-bar' + (type ? ' ' + type : '');
+}
+
+function clearRecogTimers() {
+    if (validateInterval) {
+        clearInterval(validateInterval);
+        validateInterval = null;
+    }
+    if (recogTimer) {
+        clearInterval(recogTimer);
+        recogTimer = null;
+    }
+    if (failReturnTimer) {
+        clearTimeout(failReturnTimer);
+        failReturnTimer = null;
+    }
+}
+
+function resetToStart() {
+    stopSimCamera();
+    matriculaDigits = '';
+    currentMatricula = '';
+    currentUserName = '';
+    finished = false;
+    renderMatricula();
+    setKeypadStatus('');
+    document.getElementById('btnConfirmMatricula').disabled = true;
+    showStep('stepStart');
+}
+
+function handleRecogFailure(message) {
+    if (finished) return;
+    finished = true;
+    stopSimCamera();
+    document.getElementById('failMessage').textContent = message || 'Tempo esgotado. Tente novamente.';
+    showStep('stepFail');
+    failReturnTimer = setTimeout(resetToStart, FAIL_DISPLAY_MS);
+}
+
+function renderMatricula() {
+    const box = document.getElementById('matriculaDisplay');
+    box.innerHTML = '';
+    for (let i = 0; i < 3; i++) {
+        const span = document.createElement('span');
+        span.className = 'digit' + (matriculaDigits[i] ? '' : ' empty');
+        span.textContent = matriculaDigits[i] || '_';
+        box.appendChild(span);
+    }
+    document.getElementById('btnConfirmMatricula').disabled = matriculaDigits.length !== 3;
+}
+
+function pressKey(key) {
+    setKeypadStatus('');
+    if (key === 'clear') {
+        matriculaDigits = '';
+    } else if (key === 'back') {
+        matriculaDigits = matriculaDigits.slice(0, -1);
+    } else if (/^\d$/.test(key) && matriculaDigits.length < 3) {
+        matriculaDigits += key;
+    }
+    renderMatricula();
+}
+
+document.querySelectorAll('.numpad-key').forEach((btn) => {
+    btn.addEventListener('click', () => pressKey(btn.dataset.key));
+});
+
+document.getElementById('btnStart').addEventListener('click', () => {
+    matriculaDigits = '';
+    finished = false;
+    renderMatricula();
+    setKeypadStatus('');
+    showStep('stepKeypad');
+});
+
+document.getElementById('btnBackStart').addEventListener('click', () => {
+    showStep('stepStart');
+});
+
+document.getElementById('btnConfirmMatricula').addEventListener('click', async () => {
+    if (matriculaDigits.length !== 3) return;
+    const btn = document.getElementById('btnConfirmMatricula');
+    btn.disabled = true;
+    setKeypadStatus('Verificando matrícula...');
+    try {
+        const response = await fetch('/api/matricula/' + matriculaDigits);
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            setKeypadStatus(data.error || 'Matrícula não encontrada', 'error');
+            btn.disabled = false;
+            return;
+        }
+        currentMatricula = data.usuario.matricula;
+        currentUserName = data.usuario.nome;
+        document.getElementById('cameraMatricula').textContent = currentMatricula;
+        showStep('stepCamera');
+        await startSimCamera();
+    } catch (error) {
+        setKeypadStatus('Erro: ' + error.message, 'error');
+        btn.disabled = false;
+    }
+});
+
+async function startCamera(videoEl) {
+    const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+    });
+    videoEl.srcObject = mediaStream;
+    videoEl.style.display = 'block';
+    await videoEl.play();
+    return mediaStream;
+}
+
+function stopSimCamera() {
+    clearRecogTimers();
+    if (stream) {
+        stream.getTracks().forEach((t) => t.stop());
+        stream = null;
+    }
+    const video = document.getElementById('video');
+    video.srcObject = null;
+    video.style.display = 'none';
+    document.getElementById('overlay').style.display = 'none';
+    document.getElementById('cameraPlaceholder').style.display = 'block';
+    document.getElementById('cameraStage').classList.remove('is-active');
+    isProcessing = false;
+    matchStreak = 0;
+}
+
+function updateCountdownStatus(baseText, type) {
+    const left = Math.max(0, Math.ceil((recogDeadline - Date.now()) / 1000));
+    setCameraStatus((baseText || 'Olhe para a câmera') + ' · ' + left + 's', type || '');
+}
+
+async function startSimCamera() {
+    stopSimCamera();
+    finished = false;
+    matchStreak = 0;
+    setCameraStatus('Solicitando câmera...');
+    const video = document.getElementById('video');
+    try {
+        stream = await startCamera(video);
+        document.getElementById('cameraPlaceholder').style.display = 'none';
+        document.getElementById('cameraStage').classList.add('is-active');
+
+        recogDeadline = Date.now() + RECOG_TIMEOUT_MS;
+        updateCountdownStatus('Olhe para a câmera');
+
+        validateInterval = setInterval(validateFrame, 900);
+        recogTimer = setInterval(() => {
+            if (finished) return;
+            if (Date.now() >= recogDeadline) {
+                handleRecogFailure('Tempo esgotado. Rosto não reconhecido.');
+                return;
+            }
+            updateCountdownStatus('Olhe para a câmera');
+        }, 200);
+
+        validateFrame();
+    } catch (error) {
+        handleRecogFailure('Erro ao acessar câmera: ' + (error.message || error.name));
+    }
+}
+
+async function validateFrame() {
+    if (finished || isProcessing || !stream) return;
+    if (Date.now() >= recogDeadline) {
+        handleRecogFailure('Tempo esgotado. Rosto não reconhecido.');
+        return;
+    }
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    if (!video.srcObject || video.readyState < 2 || video.videoWidth === 0) return;
+
+    isProcessing = true;
+    try {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+
+        const formData = new FormData();
+        formData.append('matricula', currentMatricula);
+        formData.append('imagem_base64', canvas.toDataURL('image/jpeg', 0.75));
+
+        const response = await fetch('{{ url_for("api_simulacao_validar") }}', {
+            method: 'POST',
+            body: formData
+        });
+        const data = await response.json();
+
+        if (finished) return;
+
+        const overlay = document.getElementById('overlay');
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+        overlay.style.display = 'block';
+        const ctx = overlay.getContext('2d');
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+        if (!response.ok) {
+            matchStreak = 0;
+            updateCountdownStatus(data.error || 'Erro na validação', 'error');
+            return;
+        }
+
+        const confPct = ((data.confidence || 0) * 100).toFixed(0);
+        if (data.matched) {
+            matchStreak += 1;
+            ctx.strokeStyle = '#067647';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(12, 12, overlay.width - 24, overlay.height - 24);
+            updateCountdownStatus('Confirmando... ' + confPct + '% (' + matchStreak + '/' + SIM_STREAK + ')', 'success');
+            if (matchStreak >= SIM_STREAK) {
+                finished = true;
+                stopSimCamera();
+                document.getElementById('welcomeName').textContent = data.nome || currentUserName;
+                document.getElementById('welcomeMeta').textContent =
+                    'Matrícula ' + (data.matricula || currentMatricula) + ' · ' + confPct + '% de confiança';
+                showStep('stepWelcome');
+                const welcome = document.getElementById('stepWelcome');
+                welcome.classList.remove('is-open');
+                void welcome.offsetWidth;
+                welcome.classList.add('is-open');
+            }
+        } else {
+            matchStreak = 0;
+            ctx.strokeStyle = '#b54708';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(12, 12, overlay.width - 24, overlay.height - 24);
+            const msg = (data.message || 'Não confirmado') + (confPct > 0 ? ' · ' + confPct + '%' : '');
+            updateCountdownStatus(msg, 'error');
+        }
+    } catch (error) {
+        console.error(error);
+        if (!finished) updateCountdownStatus('Falha na requisição', 'error');
+        matchStreak = 0;
+    } finally {
+        isProcessing = false;
+    }
+}
+
+document.getElementById('btnBackKeypad').addEventListener('click', () => {
+    stopSimCamera();
+    finished = false;
+    matriculaDigits = '';
+    renderMatricula();
+    setKeypadStatus('');
+    document.getElementById('btnConfirmMatricula').disabled = true;
+    showStep('stepKeypad');
+});
+
+document.getElementById('btnNewSim').addEventListener('click', () => {
+    resetToStart();
+});
+
+window.addEventListener('beforeunload', stopSimCamera);
+renderMatricula();
+</script>
+{% endblock %}

@@ -8,9 +8,10 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <meta name="mobile-web-app-capable" content="yes">
     <title>{% block title %}FaceID{% endblock %}</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
-<body class="app {% if request.endpoint in ['register', 'recognize'] %}page-camera{% endif %} page-{{ request.endpoint or 'index' }}">
+<body class="app {% if request.endpoint in ['register', 'recognize', 'simulacao'] %}page-camera{% endif %} page-{{ request.endpoint or 'index' }}">
     <header class="app-topbar">
         <div class="app-topbar-inner">
             <a href="{{ url_for('index') }}" class="logo">FaceID</a>
@@ -19,6 +20,7 @@
                 <a href="{{ url_for('index') }}" {% if request.endpoint == 'index' %}class="active"{% endif %}>Início</a>
                 <a href="{{ url_for('register') }}" {% if request.endpoint == 'register' %}class="active"{% endif %}>Cadastrar</a>
                 <a href="{{ url_for('recognize') }}" {% if request.endpoint == 'recognize' %}class="active"{% endif %}>Reconhecer</a>
+                <a href="{{ url_for('simulacao') }}" {% if request.endpoint == 'simulacao' %}class="active"{% endif %}>Simulação</a>
             </nav>
         </div>
     </header>
@@ -39,6 +41,10 @@
         <a href="{{ url_for('recognize') }}" class="tabbar-item {% if request.endpoint == 'recognize' %}active{% endif %}">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V4h3V2H2v5h2Zm14-3h3v3h2V2h-5v2ZM7 22H2v-5h2v3h3v2Zm15-5v5h-5v-2h3v-3h2ZM8 8h8v8H8V8Zm2 2v4h4v-4h-4Z"/></svg>
             <span>Reconhecer</span>
+        </a>
+        <a href="{{ url_for('simulacao') }}" class="tabbar-item {% if request.endpoint == 'simulacao' %}active{% endif %}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z"/></svg>
+            <span>Simulação</span>
         </a>
     </nav>
 

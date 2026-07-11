@@ -61,10 +61,22 @@ def save_image_from_base64(base64_string, save_path):
         return False
 
 
+@app.route('/favicon.ico')
+def favicon():
+    return send_from_directory(
+        os.path.join(app.root_path, 'static'),
+        'favicon.svg',
+        mimetype='image/svg+xml'
+    )
+
+
 @app.route('/')
 def index():
     """Página inicial"""
     usuarios = db.listar_usuarios()
+    for u in usuarios:
+        foto = db.foto_usuario(u['id'])
+        u['foto_url'] = url_for('serve_face', user_id=u['id'], filename=foto) if foto else None
     return render_template('index.html', usuarios=usuarios)
 
 
@@ -73,10 +85,12 @@ def register():
     """Página de cadastro de nova face"""
     if request.method == 'POST':
         nome = request.form.get('nome', '').strip()
-        cpf = request.form.get('cpf', '').strip() or None
+        matricula = Database.normalizar_matricula(request.form.get('matricula', '').strip())
 
         if not nome:
             return jsonify({'error': 'Nome é obrigatório'}), 400
+        if not matricula:
+            return jsonify({'error': 'Matrícula deve ter exatamente 3 dígitos'}), 400
 
         # Aceita uma ou várias imagens (imagem_base64 / imagem_base64_0..)
         images = []
@@ -107,9 +121,9 @@ def register():
         if not images:
             return jsonify({'error': 'Nenhuma imagem fornecida'}), 400
 
-        usuario_id = db.criar_usuario(nome, cpf)
+        usuario_id = db.criar_usuario(nome, matricula)
         if usuario_id is None:
-            return jsonify({'error': 'Erro ao criar usuário. CPF pode já estar cadastrado.'}), 400
+            return jsonify({'error': 'Erro ao criar usuário. Matrícula inválida ou já cadastrada.'}), 400
 
         user_dir = os.path.join('faces', str(usuario_id))
         os.makedirs(user_dir, exist_ok=True)
@@ -166,6 +180,7 @@ def register():
             'success': True,
             'message': f'Usuário cadastrado com {added} amostra(s).',
             'usuario_id': usuario_id,
+            'matricula': matricula,
             'samples': added,
         })
 
@@ -631,14 +646,176 @@ def api_recognize():
 def api_users():
     """API para listar usuários"""
     usuarios = db.listar_usuarios()
+    for u in usuarios:
+        foto = db.foto_usuario(u['id'])
+        u['foto_url'] = url_for('serve_face', user_id=u['id'], filename=foto) if foto else None
     return jsonify({'usuarios': usuarios})
 
 
-@app.route('/api/users/<int:user_id>', methods=['DELETE'])
-def api_delete_user(user_id):
-    """API para deletar usuário"""
+@app.route('/api/users/<int:user_id>', methods=['GET', 'PUT', 'DELETE'])
+def api_user(user_id):
+    """API para obter, atualizar ou deletar usuário"""
+    if request.method == 'GET':
+        usuario = db.buscar_usuario(user_id)
+        if not usuario:
+            return jsonify({'error': 'Usuário não encontrado'}), 404
+        foto = db.foto_usuario(user_id)
+        usuario['foto_url'] = url_for('serve_face', user_id=user_id, filename=foto) if foto else None
+        return jsonify({'success': True, 'usuario': usuario})
+
+    if request.method == 'PUT':
+        data = request.get_json(silent=True) or {}
+        nome = (data.get('nome') or request.form.get('nome') or '').strip()
+        matricula = data.get('matricula') or request.form.get('matricula') or ''
+        ok, err = db.atualizar_usuario(user_id, nome, matricula)
+        if not ok:
+            return jsonify({'error': err}), 400
+        usuario = db.buscar_usuario(user_id)
+        foto = db.foto_usuario(user_id)
+        usuario['foto_url'] = url_for('serve_face', user_id=user_id, filename=foto) if foto else None
+        return jsonify({'success': True, 'usuario': usuario})
+
     db.deletar_usuario(user_id)
+    face_recognizer.load_known_faces()
     return jsonify({'success': True, 'message': 'Usuário deletado com sucesso'})
+
+
+@app.route('/faces/<int:user_id>/<path:filename>')
+def serve_face(user_id, filename):
+    """Serve foto cadastrada do usuário."""
+    safe_name = secure_filename(filename)
+    folder = os.path.join(app.config['UPLOAD_FOLDER'], str(user_id))
+    return send_from_directory(folder, safe_name)
+
+
+@app.route('/api/matricula/<matricula>', methods=['GET'])
+def api_matricula(matricula):
+    """Verifica se a matrícula existe."""
+    usuario = db.buscar_usuario_por_matricula(matricula)
+    if not usuario:
+        return jsonify({'success': False, 'error': 'Matrícula não encontrada'}), 404
+    foto = db.foto_usuario(usuario['id'])
+    return jsonify({
+        'success': True,
+        'usuario': {
+            'id': usuario['id'],
+            'nome': usuario['nome'],
+            'matricula': usuario['matricula'],
+            'foto_url': url_for('serve_face', user_id=usuario['id'], filename=foto) if foto else None,
+        }
+    })
+
+
+@app.route('/simulacao')
+def simulacao():
+    """Fluxo de simulação: matrícula + reconhecimento 1:1."""
+    return render_template('simulacao.html')
+
+
+@app.route('/api/simulacao/validar', methods=['POST'])
+def api_simulacao_validar():
+    """
+    Valida se o rosto da câmera corresponde à matrícula informada (1:1).
+    Sucesso apenas com confidence >= 0.80.
+    """
+    matricula = Database.normalizar_matricula(request.form.get('matricula', ''))
+    if not matricula:
+        return jsonify({'success': False, 'matched': False, 'error': 'Matrícula inválida'}), 400
+
+    usuario = db.buscar_usuario_por_matricula(matricula)
+    if not usuario:
+        return jsonify({'success': False, 'matched': False, 'error': 'Matrícula não encontrada'}), 404
+
+    image = None
+    if 'imagem_base64' in request.form:
+        image = decode_base64_image(request.form['imagem_base64'])
+    elif 'imagem' in request.files:
+        file = request.files['imagem']
+        if file and file.filename:
+            nparr = np.frombuffer(file.read(), np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if image is None:
+        return jsonify({'success': False, 'matched': False, 'error': 'Nenhuma imagem fornecida'}), 400
+
+    h, w = image.shape[:2]
+    max_side = 640
+    if max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+        image = cv2.resize(image, (int(w * scale), int(h * scale)))
+
+    faces = face_recognizer.detect_faces_detailed(image)
+    if not faces:
+        return jsonify({
+            'success': True,
+            'matched': False,
+            'message': 'Nenhum rosto detectado',
+            'confidence': 0.0,
+            'nome': usuario['nome'],
+            'matricula': matricula,
+        })
+
+    face = max(faces, key=lambda f: f.get('score', 0))
+    probe = face_recognizer.extract_embedding(image, face)
+    if probe is None:
+        return jsonify({
+            'success': True,
+            'matched': False,
+            'message': 'Não foi possível ler o rosto',
+            'confidence': 0.0,
+            'nome': usuario['nome'],
+            'matricula': matricula,
+        })
+
+    uid = int(usuario['id'])
+    gallery = face_recognizer.known_faces.get(uid) or []
+    if not gallery:
+        # Tenta carregar encodings do banco
+        gallery = db.buscar_encodings_usuario(uid)
+        if gallery:
+            face_recognizer.known_faces[uid] = [
+                np.asarray(e, dtype=np.float32).flatten() for e in gallery
+            ]
+            gallery = face_recognizer.known_faces[uid]
+
+    if not gallery:
+        return jsonify({
+            'success': True,
+            'matched': False,
+            'message': 'Usuário sem face cadastrada',
+            'confidence': 0.0,
+            'nome': usuario['nome'],
+            'matricula': matricula,
+        })
+
+    scores = sorted(
+        (face_recognizer.compare_features(probe, emb) for emb in gallery),
+        reverse=True,
+    )
+    confidence = float(np.mean(scores[:2])) if len(scores) >= 2 else float(scores[0])
+
+    SIM_THRESHOLD = 0.80
+
+    if confidence < SIM_THRESHOLD:
+        return jsonify({
+            'success': True,
+            'matched': False,
+            'message': 'Rosto não corresponde à matrícula' if confidence < 0.45
+                       else 'Confiança baixa. Aproxime-se e olhe para a câmera.',
+            'confidence': confidence,
+            'nome': usuario['nome'],
+            'matricula': matricula,
+        })
+
+    return jsonify({
+        'success': True,
+        'matched': True,
+        'message': 'Identidade confirmada',
+        'confidence': confidence,
+        'nome': usuario['nome'],
+        'matricula': matricula,
+        'usuario_id': uid,
+    })
 
 
 if __name__ == '__main__':

@@ -3,8 +3,6 @@ Módulo para gerenciamento do banco de dados SQLite
 """
 import sqlite3
 import os
-from datetime import datetime
-import numpy as np
 import pickle
 
 
@@ -12,29 +10,27 @@ class Database:
     def __init__(self, db_path='usuarios.db'):
         self.db_path = db_path
         self.init_database()
-    
+
     def get_connection(self):
         """Retorna uma conexão com o banco de dados"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
-    
+
     def init_database(self):
         """Inicializa o banco de dados criando as tabelas necessárias"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        
-        # Tabela de usuários
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS usuarios (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 nome TEXT NOT NULL,
-                cpf TEXT UNIQUE,
+                matricula TEXT UNIQUE,
                 data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
-        # Tabela de encodings faciais
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS face_encodings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,69 +40,189 @@ class Database:
                 FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
             )
         ''')
-        
+
+        self._migrate_cpf_to_matricula(cursor)
+        self._ensure_matriculas(cursor)
+
         conn.commit()
         conn.close()
-    
-    def criar_usuario(self, nome, cpf=None):
+
+    def _table_columns(self, cursor, table_name):
+        cursor.execute(f'PRAGMA table_info({table_name})')
+        return {row[1] for row in cursor.fetchall()}
+
+    def _migrate_cpf_to_matricula(self, cursor):
+        """Migra coluna cpf → matricula em bancos antigos."""
+        cols = self._table_columns(cursor, 'usuarios')
+        if 'matricula' in cols:
+            return
+
+        if 'cpf' in cols:
+            cursor.execute('ALTER TABLE usuarios ADD COLUMN matricula TEXT')
+            cursor.execute(
+                "UPDATE usuarios SET matricula = printf('%03d', id) "
+                "WHERE matricula IS NULL OR matricula = ''"
+            )
+            # Copia CPF numérico de 3 dígitos se existir e ainda não conflitar
+            cursor.execute('SELECT id, cpf FROM usuarios WHERE cpf IS NOT NULL AND cpf != ""')
+            for row in cursor.fetchall():
+                digits = ''.join(c for c in str(row['cpf']) if c.isdigit())
+                if len(digits) == 3:
+                    cursor.execute(
+                        'UPDATE usuarios SET matricula = ? WHERE id = ? '
+                        'AND NOT EXISTS (SELECT 1 FROM usuarios u2 WHERE u2.matricula = ? AND u2.id != ?)',
+                        (digits, row['id'], digits, row['id'])
+                    )
+            try:
+                cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_matricula ON usuarios(matricula)')
+            except sqlite3.OperationalError:
+                pass
+        else:
+            cursor.execute('ALTER TABLE usuarios ADD COLUMN matricula TEXT')
+            try:
+                cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_matricula ON usuarios(matricula)')
+            except sqlite3.OperationalError:
+                pass
+
+    def _ensure_matriculas(self, cursor):
+        """Garante matrícula de 3 dígitos em todos os usuários."""
+        cols = self._table_columns(cursor, 'usuarios')
+        if 'matricula' not in cols:
+            return
+
+        cursor.execute('SELECT id, matricula FROM usuarios ORDER BY id')
+        rows = cursor.fetchall()
+        used = set()
+        for row in rows:
+            mat = (row['matricula'] or '').strip()
+            if len(mat) == 3 and mat.isdigit():
+                used.add(mat)
+
+        next_num = 1
+        for row in rows:
+            mat = (row['matricula'] or '').strip()
+            if len(mat) == 3 and mat.isdigit():
+                continue
+            while True:
+                candidate = f'{next_num:03d}'
+                next_num += 1
+                if candidate not in used:
+                    break
+            used.add(candidate)
+            cursor.execute('UPDATE usuarios SET matricula = ? WHERE id = ?', (candidate, row['id']))
+
+    @staticmethod
+    def normalizar_matricula(matricula):
+        if matricula is None:
+            return None
+        digits = ''.join(c for c in str(matricula) if c.isdigit())
+        if len(digits) != 3:
+            return None
+        return digits
+
+    def criar_usuario(self, nome, matricula=None):
         """
-        Cria um novo usuário no banco de dados
-        Retorna o ID do usuário criado
+        Cria um novo usuário no banco de dados.
+        Retorna o ID do usuário criado ou None se matrícula inválida/duplicada.
         """
+        matricula = self.normalizar_matricula(matricula)
+        if not matricula:
+            return None
+
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         try:
             cursor.execute(
-                'INSERT INTO usuarios (nome, cpf) VALUES (?, ?)',
-                (nome, cpf)
+                'INSERT INTO usuarios (nome, matricula) VALUES (?, ?)',
+                (nome, matricula)
             )
             usuario_id = cursor.lastrowid
             conn.commit()
             return usuario_id
         except sqlite3.IntegrityError:
-            # CPF já existe
             return None
         finally:
             conn.close()
-    
+
+    def atualizar_usuario(self, usuario_id, nome, matricula):
+        """Atualiza nome e matrícula. Retorna (ok, erro)."""
+        matricula = self.normalizar_matricula(matricula)
+        if not nome or not nome.strip():
+            return False, 'Nome é obrigatório'
+        if not matricula:
+            return False, 'Matrícula deve ter exatamente 3 dígitos'
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                'UPDATE usuarios SET nome = ?, matricula = ? WHERE id = ?',
+                (nome.strip(), matricula, usuario_id)
+            )
+            if cursor.rowcount == 0:
+                return False, 'Usuário não encontrado'
+            conn.commit()
+            return True, None
+        except sqlite3.IntegrityError:
+            return False, 'Matrícula já está em uso'
+        finally:
+            conn.close()
+
     def buscar_usuario(self, usuario_id):
         """Busca um usuário pelo ID"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute('SELECT * FROM usuarios WHERE id = ?', (usuario_id,))
         row = cursor.fetchone()
         conn.close()
-        
+
         if row:
             return dict(row)
         return None
-    
-    def buscar_usuario_por_cpf(self, cpf):
-        """Busca um usuário pelo CPF"""
+
+    def buscar_usuario_por_matricula(self, matricula):
+        """Busca um usuário pela matrícula"""
+        matricula = self.normalizar_matricula(matricula)
+        if not matricula:
+            return None
+
         conn = self.get_connection()
         cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM usuarios WHERE cpf = ?', (cpf,))
+
+        cursor.execute('SELECT * FROM usuarios WHERE matricula = ?', (matricula,))
         row = cursor.fetchone()
         conn.close()
-        
+
         if row:
             return dict(row)
         return None
-    
+
     def listar_usuarios(self):
         """Lista todos os usuários cadastrados"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute('SELECT * FROM usuarios ORDER BY nome')
         rows = cursor.fetchall()
         conn.close()
-        
+
         return [dict(row) for row in rows]
-    
+
+    def foto_usuario(self, usuario_id):
+        """
+        Retorna o nome do primeiro arquivo de foto do usuário, ou None.
+        """
+        user_dir = os.path.join('faces', str(usuario_id))
+        if not os.path.isdir(user_dir):
+            return None
+        files = sorted(
+            f for f in os.listdir(user_dir)
+            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp'))
+        )
+        return files[0] if files else None
+
     def adicionar_encoding(self, usuario_id, encoding):
         """
         Adiciona um encoding facial para um usuário
@@ -114,17 +230,16 @@ class Database:
         """
         conn = self.get_connection()
         cursor = conn.cursor()
-        
-        # Serializa o encoding para BLOB
+
         encoding_blob = pickle.dumps(encoding)
-        
+
         cursor.execute(
             'INSERT INTO face_encodings (usuario_id, encoding) VALUES (?, ?)',
             (usuario_id, encoding_blob)
         )
         conn.commit()
         conn.close()
-    
+
     def buscar_encodings_usuario(self, usuario_id):
         """
         Busca todos os encodings de um usuário
@@ -132,21 +247,21 @@ class Database:
         """
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute(
             'SELECT encoding FROM face_encodings WHERE usuario_id = ?',
             (usuario_id,)
         )
         rows = cursor.fetchall()
         conn.close()
-        
+
         encodings = []
         for row in rows:
             encoding = pickle.loads(row['encoding'])
             encodings.append(encoding)
-        
+
         return encodings
-    
+
     def buscar_todos_encodings(self):
         """
         Busca todos os encodings com informações do usuário
@@ -154,7 +269,7 @@ class Database:
         """
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute('''
             SELECT u.id as usuario_id, u.nome, fe.encoding
             FROM face_encodings fe
@@ -162,7 +277,7 @@ class Database:
         ''')
         rows = cursor.fetchall()
         conn.close()
-        
+
         encodings_data = []
         for row in rows:
             encoding = pickle.loads(row['encoding'])
@@ -171,19 +286,19 @@ class Database:
                 'nome': row['nome'],
                 'encoding': encoding
             })
-        
+
         return encodings_data
-    
+
     def deletar_usuario(self, usuario_id):
         """Deleta um usuário e todos os seus encodings"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        
+
+        cursor.execute('DELETE FROM face_encodings WHERE usuario_id = ?', (usuario_id,))
         cursor.execute('DELETE FROM usuarios WHERE id = ?', (usuario_id,))
         conn.commit()
         conn.close()
-        
-        # Remove diretório de imagens do usuário
+
         user_dir = os.path.join('faces', str(usuario_id))
         if os.path.exists(user_dir):
             import shutil
