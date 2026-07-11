@@ -6,9 +6,18 @@ import os
 import pickle
 
 
+def default_db_path():
+    """Usa FACE_DATA_DIR (volume persistente) quando definido."""
+    data_dir = os.environ.get('FACE_DATA_DIR', '').strip()
+    if data_dir:
+        os.makedirs(data_dir, exist_ok=True)
+        return os.path.join(data_dir, 'usuarios.db')
+    return 'usuarios.db'
+
+
 class Database:
-    def __init__(self, db_path='usuarios.db'):
-        self.db_path = db_path
+    def __init__(self, db_path=None):
+        self.db_path = db_path or default_db_path()
         self.init_database()
 
     def get_connection(self):
@@ -36,6 +45,17 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 usuario_id INTEGER NOT NULL,
                 encoding BLOB NOT NULL,
+                data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS face_photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER NOT NULL,
+                cloudinary_public_id TEXT,
+                cloudinary_url TEXT,
                 data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
             )
@@ -212,20 +232,17 @@ class Database:
 
     def foto_usuario(self, usuario_id):
         """
-        Retorna o nome do primeiro arquivo de foto do usuário, ou None.
+        Retorna URL Cloudinary ou nome do primeiro arquivo local, ou None.
         """
-        fotos = self.listar_fotos(usuario_id)
+        cloud = self.listar_fotos_cloudinary(usuario_id)
+        if cloud and cloud[0].get('cloudinary_url'):
+            return cloud[0]['cloudinary_url']
+        fotos = self.listar_fotos_locais(usuario_id)
         return fotos[0] if fotos else None
 
     def listar_fotos(self, usuario_id):
-        """Lista nomes de arquivos de foto do usuário."""
-        user_dir = os.path.join('faces', str(usuario_id))
-        if not os.path.isdir(user_dir):
-            return []
-        return sorted(
-            f for f in os.listdir(user_dir)
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp'))
-        )
+        """Lista nomes de arquivos locais de foto do usuário (UI Flask)."""
+        return self.listar_fotos_locais(usuario_id)
 
     def limpar_encodings(self, usuario_id):
         """Remove todos os encodings faciais do usuário."""
@@ -236,15 +253,65 @@ class Database:
         conn.close()
 
     def limpar_fotos(self, usuario_id):
-        """Remove arquivos de foto do usuário (mantém a pasta)."""
+        """Remove fotos locais e registros Cloudinary do usuário."""
+        user_dir = os.path.join('faces', str(usuario_id))
+        if os.path.isdir(user_dir):
+            for name in self.listar_fotos_locais(usuario_id):
+                try:
+                    os.remove(os.path.join(user_dir, name))
+                except OSError:
+                    pass
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM face_photos WHERE usuario_id = ?', (usuario_id,))
+        conn.commit()
+        conn.close()
+
+    def listar_fotos_locais(self, usuario_id):
+        """Lista nomes de arquivos locais do usuário."""
         user_dir = os.path.join('faces', str(usuario_id))
         if not os.path.isdir(user_dir):
-            return
-        for name in self.listar_fotos(usuario_id):
-            try:
-                os.remove(os.path.join(user_dir, name))
-            except OSError:
-                pass
+            return []
+        return sorted(
+            f for f in os.listdir(user_dir)
+            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp'))
+        )
+
+    def adicionar_foto_cloudinary(self, usuario_id, public_id, url):
+        """Registra uma foto hospedada no Cloudinary."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO face_photos (usuario_id, cloudinary_public_id, cloudinary_url) VALUES (?, ?, ?)',
+            (usuario_id, public_id, url)
+        )
+        conn.commit()
+        conn.close()
+
+    def listar_fotos_cloudinary(self, usuario_id):
+        """Lista fotos Cloudinary do usuário."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT id, cloudinary_public_id, cloudinary_url, data_cadastro '
+            'FROM face_photos WHERE usuario_id = ? ORDER BY id',
+            (usuario_id,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def tem_rosto_cadastrado(self, usuario_id):
+        """True se há pelo menos um encoding facial."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT COUNT(*) AS c FROM face_encodings WHERE usuario_id = ?',
+            (usuario_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return bool(row and row['c'] > 0)
 
     def adicionar_encoding(self, usuario_id, encoding):
         """

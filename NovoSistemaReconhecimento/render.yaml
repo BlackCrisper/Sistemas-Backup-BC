@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: refeicontrol-face-id
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn api_server:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: FACE_API_KEY
+        sync: false
+      - key: REQUIRE_FACE_API_KEY
+        value: "1"
+      - key: FACE_DATA_DIR
+        value: /var/data
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: FACE_MATCH_THRESHOLD
+        value: "0.80"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+    disk:
+      name: face-data
+      mountPath: /var/data
+      sizeGB: 1

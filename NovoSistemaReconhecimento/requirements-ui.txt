@@ -1,0 +1,5 @@
+# Dependências extras para a UI local (app.py) com YOLO opcional
+-r requirements.txt
+ultralytics>=8.0.0
+opencv-python>=4.8.0,<5.0.0
+cryptography>=41.0.0
