@@ -208,7 +208,7 @@ def api_enroll():
 
     added, last_error = enroll_faces_for_user(
         db, face_recognizer, facial_analysis,
-        usuario_id, images, matricula, replace=replace,
+        usuario_id, images, matricula, replace=replace, nome=nome,
     )
     if added == 0:
         return jsonify({'error': last_error, 'code': 'ENROLL_FAILED'}), 400
@@ -279,7 +279,7 @@ def api_user_by_matricula(matricula):
         })
 
     # DELETE
-    cloudinary_storage.delete_folder_for_matricula(matricula)
+    cloudinary_storage.delete_folder_for_matricula(matricula, usuario.get('nome') or '')
     uid = int(usuario['id'])
     face_recognizer.known_faces.pop(uid, None)
     db.deletar_usuario(uid)
@@ -289,6 +289,31 @@ def api_user_by_matricula(matricula):
     except Exception as e:
         print(f'Falha ao sincronizar Cloudinary após delete: {e}')
     return jsonify({'success': True, 'message': 'Usuário facial removido', 'matricula': matricula})
+
+
+@app.route('/api/users/enrolled', methods=['GET'])
+@require_api_key
+def api_users_enrolled():
+    """Lista matrículas com rosto cadastrado (para a tela de usuários do RefeiControl)."""
+    enrolled = []
+    for u in db.listar_usuarios():
+        uid = int(u['id'])
+        if not db.tem_rosto_cadastrado(uid):
+            continue
+        mat = u.get('matricula')
+        if not mat:
+            continue
+        enrolled.append({
+            'matricula': mat,
+            'nome': u.get('nome'),
+            'enrolled': True,
+        })
+    return jsonify({
+        'success': True,
+        'count': len(enrolled),
+        'matriculas': [e['matricula'] for e in enrolled],
+        'users': enrolled,
+    })
 
 
 @app.route('/api/matricula/<matricula>', methods=['GET'])

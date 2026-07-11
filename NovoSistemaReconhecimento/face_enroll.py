@@ -36,14 +36,15 @@ def enroll_faces_for_user(
     images: List[np.ndarray],
     matricula: str,
     replace: bool = False,
+    nome: str = '',
 ) -> Tuple[int, str]:
     """
-    Valida e cadastra faces. Uploads vão para Cloudinary quando configurado.
+    Valida e cadastra faces. Uploads vão para Cloudinary (pasta por usuário).
     Retorna (added_count, last_error).
     """
     if replace:
         photos = db.listar_fotos_cloudinary(usuario_id)
-        cloudinary_storage.delete_folder_for_matricula(matricula)
+        cloudinary_storage.delete_folder_for_matricula(matricula, nome)
         db.limpar_encodings(usuario_id)
         db.limpar_fotos(usuario_id)
         face_recognizer.known_faces.pop(int(usuario_id), None)
@@ -92,7 +93,11 @@ def enroll_faces_for_user(
             continue
 
         jpeg = image_to_jpeg_bytes(image)
-        uploaded = cloudinary_storage.upload_face_image(jpeg, matricula, photo_index) if jpeg else None
+        uploaded = (
+            cloudinary_storage.upload_face_image(jpeg, matricula, photo_index, nome=nome)
+            if jpeg
+            else None
+        )
         if uploaded:
             public_id, url = uploaded
             db.adicionar_foto_cloudinary(usuario_id, public_id, url)

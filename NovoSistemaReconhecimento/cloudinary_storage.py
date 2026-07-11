@@ -1,8 +1,9 @@
 """
 Upload e remoção de fotos faciais no Cloudinary.
-Se as credenciais não estiverem configuradas, as operações são no-op (embeddings ainda funcionam).
+Pasta por usuário: refeicontrol/faces/{matricula}-{nome}
 """
 import os
+import re
 from typing import List, Optional, Tuple
 
 _configured = False
@@ -33,23 +34,46 @@ def _ensure_cloudinary():
     return True
 
 
-def upload_face_image(image_bytes: bytes, matricula: str, index: int) -> Optional[Tuple[str, str]]:
+def _slug_nome(nome: str) -> str:
+    raw = (nome or '').strip()
+    slug = re.sub(r'[^a-zA-Z0-9_-]+', '_', raw)
+    slug = re.sub(r'_+', '_', slug).strip('_')[:40]
+    return slug
+
+
+def folder_for_user(matricula: str, nome: str = '') -> str:
+    """Pasta dedicada no Cloudinary para o usuário."""
+    mat = str(matricula or '').strip()
+    slug = _slug_nome(nome)
+    if slug:
+        return f'refeicontrol/faces/{mat}-{slug}'
+    return f'refeicontrol/faces/{mat}'
+
+
+def upload_face_image(
+    image_bytes: bytes,
+    matricula: str,
+    index: int,
+    nome: str = '',
+) -> Optional[Tuple[str, str]]:
     """
-    Faz upload de uma imagem JPEG/PNG.
+    Faz upload de uma imagem JPEG/PNG na pasta do usuário.
     Retorna (public_id, secure_url) ou None se Cloudinary não estiver configurado/falhar.
     """
     if not _ensure_cloudinary():
         return None
     try:
         import cloudinary.uploader
-        folder = f"refeicontrol/faces/{matricula}"
+        folder = folder_for_user(matricula, nome)
         result = cloudinary.uploader.upload(
             image_bytes,
             folder=folder,
-            public_id=f"sample_{index}",
+            public_id=f'sample_{index}',
             overwrite=True,
             resource_type='image',
             format='jpg',
+            tags=[f'matricula:{matricula}', 'refeicontrol-face'],
+            context=f'matricula={matricula}|nome={nome or matricula}',
         )
         return result.get('public_id'), result.get('secure_url')
     except Exception as e:
@@ -57,13 +81,15 @@ def upload_face_image(image_bytes: bytes, matricula: str, index: int) -> Optiona
         return None
 
 
-def delete_folder_for_matricula(matricula: str) -> int:
-    """Remove recursos da pasta do usuário. Retorna quantidade aproximada removida."""
+def delete_folder_for_matricula(matricula: str, nome: str = '') -> int:
+    """Remove recursos da pasta do usuário (padrão novo e antigo)."""
     if not _ensure_cloudinary():
         return 0
     try:
         import cloudinary.api
-        prefix = f"refeicontrol/faces/{matricula}"
+        mat = str(matricula or '').strip()
+        # Prefixo cobre faces/{mat}/... e faces/{mat}-Nome/...
+        prefix = f'refeicontrol/faces/{mat}'
         result = cloudinary.api.delete_resources_by_prefix(prefix)
         deleted = result.get('deleted') or {}
         return len(deleted)
