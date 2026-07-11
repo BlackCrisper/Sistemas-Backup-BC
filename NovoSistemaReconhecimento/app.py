@@ -777,7 +777,7 @@ def api_matricula(matricula):
 def api_simulacao_reconhecer():
     """
     Reconhecimento 1:N para a simulação (sem matrícula prévia).
-    Retorna candidato quando confidence >= 0.55.
+    Retorna candidato quando confidence >= 0.80.
     """
     image = None
     if 'imagem_base64' in request.form:
@@ -810,13 +810,13 @@ def api_simulacao_reconhecer():
     confidence = float(best.get('confidence') or 0.0)
     usuario_id = best.get('usuario_id')
 
-    CANDIDATE_THRESHOLD = 0.55
+    CANDIDATE_THRESHOLD = 0.80
 
     if not usuario_id or confidence < CANDIDATE_THRESHOLD:
         return jsonify({
             'success': True,
             'matched': False,
-            'message': 'Rosto não reconhecido' if not usuario_id else 'Confiança baixa. Aproxime-se.',
+            'message': 'Rosto não reconhecido' if not usuario_id else 'Confiança abaixo de 80%. Aproxime-se.',
             'confidence': confidence,
         })
 

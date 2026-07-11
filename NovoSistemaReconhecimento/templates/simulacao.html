@@ -34,15 +34,34 @@
 
     <!-- Confirmação: é você? -->
     <section id="stepConfirm" class="sim-step" hidden>
-        <div class="sim-confirm-card">
-            <img id="confirmPhoto" class="sim-confirm-photo" alt="" hidden>
-            <div id="confirmAvatar" class="sim-confirm-avatar" aria-hidden="true">?</div>
-            <p class="match-label">É você?</p>
-            <h2 id="confirmName" class="match-name">—</h2>
-            <p id="confirmMeta" class="match-confidence"></p>
-            <p class="sim-confirm-question">Confirma que esta é a sua identidade?</p>
+        <div class="sim-confirm">
+            <div class="sim-confirm-visual">
+                <div class="sim-confirm-ring" aria-hidden="true"></div>
+                <img id="confirmPhoto" class="sim-confirm-photo" alt="" hidden>
+                <div id="confirmAvatar" class="sim-confirm-avatar" aria-hidden="true">?</div>
+            </div>
+
+            <p class="sim-confirm-kicker">Identidade encontrada</p>
+            <h2 id="confirmName" class="sim-confirm-name">—</h2>
+
+            <div class="sim-confirm-details">
+                <div class="sim-confirm-row">
+                    <span class="sim-confirm-key">Matrícula</span>
+                    <strong id="confirmMatricula" class="sim-confirm-value">—</strong>
+                </div>
+                <div class="sim-confirm-row">
+                    <span class="sim-confirm-key">Confiança</span>
+                    <strong id="confirmConfidence" class="sim-confirm-value sim-confirm-value-accent">—</strong>
+                </div>
+            </div>
+
+            <div class="sim-confirm-meter" aria-hidden="true">
+                <div id="confirmMeterBar" class="sim-confirm-meter-bar"></div>
+            </div>
+
+            <p class="sim-confirm-question">É você?</p>
             <div class="sim-confirm-actions">
-                <button type="button" id="btnConfirmYes" class="btn btn-primary">Sim, sou eu</button>
+                <button type="button" id="btnConfirmYes" class="btn btn-primary btn-lg">Sim, sou eu</button>
                 <button type="button" id="btnConfirmNo" class="btn btn-secondary">Não sou eu</button>
             </div>
         </div>
@@ -98,12 +117,20 @@ function showStep(id) {
         document.getElementById(stepId).hidden = stepId !== id;
     });
     const welcome = document.getElementById('stepWelcome');
+    const confirm = document.getElementById('stepConfirm');
     if (id === 'stepWelcome') {
         welcome.classList.remove('is-open');
         void welcome.offsetWidth;
         welcome.classList.add('is-open');
     } else {
         welcome.classList.remove('is-open');
+    }
+    if (id === 'stepConfirm') {
+        confirm.classList.remove('is-open');
+        void confirm.offsetWidth;
+        confirm.classList.add('is-open');
+    } else {
+        confirm.classList.remove('is-open');
     }
 }
 
@@ -143,6 +170,7 @@ function showConfirm(data) {
     const avatar = document.getElementById('confirmAvatar');
     if (data.foto_url) {
         photo.src = data.foto_url;
+        photo.alt = data.nome || 'Foto do usuário';
         photo.hidden = false;
         avatar.hidden = true;
     } else {
@@ -150,11 +178,16 @@ function showConfirm(data) {
         avatar.hidden = false;
         avatar.textContent = (data.nome || '?').charAt(0).toUpperCase();
     }
+    const confPct = Math.round((data.confidence || 0) * 100);
     document.getElementById('confirmName').textContent = data.nome || '—';
-    const confPct = ((data.confidence || 0) * 100).toFixed(0);
-    document.getElementById('confirmMeta').textContent =
-        'Matrícula ' + (data.matricula || '—') + ' · ' + confPct + '% de confiança';
+    document.getElementById('confirmMatricula').textContent = data.matricula || '—';
+    document.getElementById('confirmConfidence').textContent = confPct + '%';
+    const bar = document.getElementById('confirmMeterBar');
+    bar.style.width = '0%';
     showStep('stepConfirm');
+    requestAnimationFrame(() => {
+        bar.style.width = Math.min(100, Math.max(0, confPct)) + '%';
+    });
 }
 
 async function startCamera(videoEl) {
